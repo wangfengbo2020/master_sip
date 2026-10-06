@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>基于 SIP/RTP 的 4G 集群对讲系统阶段报告</title>
+  <style>
+    :root { --blue:#1f5f9b; --light:#f4f7fa; --border:#d8e0e8; --text:#24313d; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--text); background:#eef2f6; font-family:"Microsoft YaHei", "PingFang SC", Arial, sans-serif; line-height:1.75; }
+    main { max-width:1080px; margin:32px auto; padding:42px 54px; background:#fff; box-shadow:0 2px 14px rgba(0,0,0,.08); }
+    h1 { color:var(--blue); font-size:30px; margin:0 0 8px; border-bottom:3px solid var(--blue); padding-bottom:14px; }
+    h2 { color:var(--blue); font-size:22px; margin-top:34px; border-bottom:1px solid var(--border); padding-bottom:6px; }
+    h3 { color:#315f83; font-size:18px; margin-top:24px; }
+    .meta { color:#5a6875; margin:0 0 22px; }
+    .summary { background:#edf6ff; border-left:5px solid var(--blue); padding:14px 18px; margin:20px 0; }
+    .repo { background:#fff8e6; border:1px solid #edd18a; padding:12px 16px; margin:18px 0; }
+    code { background:#f1f3f5; padding:2px 5px; border-radius:3px; }
+    pre { background:#17212b; color:#e6edf3; padding:15px 18px; border-radius:5px; overflow:auto; line-height:1.45; }
+    table { width:100%; border-collapse:collapse; margin:12px 0 20px; }
+    th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+    th { background:var(--light); }
+    li { margin:4px 0; }
+    .ok { color:#18733b; font-weight:bold; }
+    .warn { color:#9a5b00; font-weight:bold; }
+    footer { margin-top:36px; padding-top:15px; border-top:1px solid var(--border); color:#687582; font-size:13px; }
+    @media print { body { background:#fff; } main { box-shadow:none; margin:0; max-width:none; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>基于 SIP/RTP 的 4G 集群对讲系统阶段报告</h1>
+  <p class="meta"><strong>报告日期：</strong>2026-10-06　<strong>项目阶段：</strong>PC/WSL 原型、ARM64 ECS 服务端和自动部署验证完成</p>
+  <div class="repo">
+    <strong>项目 Git 仓库：</strong><br>
+    SSH：<code>git@github.com:wangfengbo2020/master_sip.git</code><br>
+    Web：<a href="https://github.com/wangfengbo2020/master_sip">https://github.com/wangfengbo2020/master_sip</a>
+  </div>
+  <div class="summary"><strong>阶段结论：</strong>三客户端 SIP 注册、群组管理、抢麦控制、ECS 一对多 RTP 转发、NAT 地址学习、毫秒级延时统计和 ECS systemd 自启动链路已打通。当前下一阶段重点是接入真实 Opus 音频、完成移远模组适配、功耗测量和生产级安全加固。</div>
+
+  <h2>1. 项目背景与目标</h2>
+  <p>本项目面向电池供电的 4G 对讲设备，设备以“组”为单位通信。同一组内同一时间只允许一个设备讲话，其他设备处于监听状态。讲话设备按下讲话键后先向服务器申请讲话权，服务器批准后才发送音频。所有音频经过服务器转发，客户端之间不直接传输媒体。</p>
+  <ol>
+    <li>使用纯 C 实现不依赖第三方 SIP/RTP 库的可运行原型。</li>
+    <li>在 WSL 上模拟三个客户端，在 ARM64 ECS 上运行服务端。</li>
+    <li>验证注册、入组、抢麦、释放讲话权和组内一对多 RTP 转发。</li>
+    <li>模拟每秒 40 个 Opus RTP 包，并统计毫秒级端到端延时。</li>
+    <li>解决 WSL/NAT 场景下服务器向错误 RTP 地址转发的问题。</li>
+    <li>将 ECS 服务端改为 systemd 自启动，并支持自动编译和自动重启。</li>
+  </ol>
+
+  <h2>2. 需求与设计</h2>
+  <h3>2.1 业务需求</h3>
+  <ul>
+    <li>三个客户端加入同一个群组，例如 <code>group_01</code>。</li>
+    <li>任意客户端输入 <code>talk</code> 申请讲话权，输入 <code>release</code> 释放讲话权。</li>
+    <li>同一组只有一个讲话者，其他客户端只能监听。</li>
+    <li>讲话者异常退出或超时后，服务器自动释放讲话权。</li>
+    <li>所有 RTP 音频经过 ECS 服务器转发，客户端拒绝非服务器来源的 RTP。</li>
+  </ul>
+  <h3>2.2 协议分工</h3>
+  <table>
+    <tr><th>协议/消息</th><th>用途</th></tr>
+    <tr><td>SIP REGISTER</td><td>客户端注册并上报 RTP 接收端口</td></tr>
+    <tr><td>SIP INVITE</td><td>加入指定群组</td></tr>
+    <tr><td>SIP MESSAGE / PTT-REQUEST</td><td>申请讲话权</td></tr>
+    <tr><td>SIP MESSAGE / PTT-RELEASE</td><td>释放讲话权</td></tr>
+    <tr><td>PTT-LISTEN / PTT-IDLE</td><td>服务器通知组成员进入监听或空闲状态</td></tr>
+    <tr><td>RTP/UDP</td><td>承载 Opus 音频数据和发送时间戳</td></tr>
+  </table>
+  <pre>client_001 -- SIP REGISTER/INVITE/MESSAGE --+\nclient_002 -- SIP REGISTER/INVITE/MESSAGE --+--> ECS SIP :5060\nclient_003 -- SIP REGISTER/INVITE/MESSAGE --+\n\n讲话客户端 -- RTP/UDP --> ECS RTP :40000\n                         ECS 转发 --> 同组其他客户端</pre>
+  <p>服务器为每个 <code>group_id</code> 保存讲话权状态：<code>FREE</code>、<code>OWNED_BY_CLIENT</code>。只有收到 <code>GRANTED</code> 后客户端才发送 RTP，其他申请返回 <code>BUSY</code>。</p>
+
+  <h2>3. 音频、带宽与功耗考虑</h2>
+  <ul>
+    <li>目标格式：单声道 Opus，目标码率 16 kbit/s。</li>
+    <li>包率：40 包/秒，每包 25 ms 音频。</li>
+    <li>模拟 payload：约 50 字节/包；RTP 时间戳每包增加 1200（48 kHz）。</li>
+    <li>空闲监听状态 RTP NAT 保活间隔：10 秒。</li>
+  </ul>
+  <pre>50 字节 × 40 = 2000 字节/秒 = 16.00 kbit/s\nRTP 扩展约 24 字节 + UDP 8 字节 + IPv4 20 字节\n总计约 102 字节/包 × 40 = 32.64 kbit/s\n单向媒体流约 14.01 MiB/小时</pre>
+  <p>三人组一人讲话、两人监听时，讲话端上行约 32.64 kbit/s，每个监听端下行约 32.64 kbit/s，ECS 出口合计约 65.28 kbit/s。当前 PC 原型模拟 Opus 编码后的包长和二进制内容，尚未执行真实 PCM 到 Opus 的编码。</p>
+
+  <h2>4. 延时统计方案</h2>
+  <p>讲话端在 RTP 扩展头中写入 64 位 Unix 毫秒发送时间戳，服务器转发时不修改该字段，监听端按照“接收时间戳 - 发送时间戳”计算单向延时，每秒输出一次统计。</p>
+  <pre>[client_002] [rx/1s] via=server packets=40 opus_payload=2000 bytes delay_ms avg=0.5 min=0 max=1 missing_timestamp=0</pre>
+  <p>真实不同设备之间测量前需要 NTP 或网络授时，否则结果会混入发送端与接收端的时钟偏差。WSL 客户端共用同一台 PC 时钟，适合当前原型验证。</p>
+
+  <h2>5. NAT/RTP 转发问题与修复</h2>
+  <p>原始实现使用 SIP/SDP 中声明的 <code>198.18.0.1:20002</code> 等地址作为监听端点。该地址对 ECS 不可达，虽然服务器打印 <code>recipients=2</code>，但监听端收不到数据。</p>
+  <p>修复方案是客户端使用 RTP socket 发送 payload type 为 <code>126</code> 的 Keepalive，服务器根据实际 UDP 源地址和 SSRC 学习客户端真实公网 RTP endpoint。Keepalive 加入群组后立即发送，空闲时每 10 秒发送一次，讲话时由正常 RTP 包维持 NAT 映射。Keepalive 只用于学习地址，不转发。</p>
+
+  <h2>6. 软件实现与代码结构</h2>
+  <table>
+    <tr><th>文件</th><th>职责</th></tr>
+    <tr><td><code>include/ptt_common.h</code></td><td>协议常量、SIP/RTP 结构和公共接口</td></tr>
+    <tr><td><code>src/ptt_common.c</code></td><td>SIP 解析、RTP 封装和 RTP 解析</td></tr>
+    <tr><td><code>src/ptt_server.c</code></td><td>注册表、群组、讲话权、endpoint 学习和 RTP 一对多转发</td></tr>
+    <tr><td><code>src/ptt_client.c</code></td><td>SIP 状态机、命令行控制、抢麦、RTP 发送和接收统计</td></tr>
+    <tr><td><code>scripts/build_server_arm.sh</code></td><td>ECS ARM64 本机 GCC 编译</td></tr>
+    <tr><td><code>scripts/auto_deploy_server.sh</code></td><td>自动检测、编译、启动和重启</td></tr>
+    <tr><td><code>deploy/ptt-server-autodeploy.service</code></td><td>systemd 自启动单元</td></tr>
+  </table>
+  <p>WSL 客户端构建：</p>
+  <pre>cmake -S . -B build\ncmake --build build -j</pre>
+  <p>ECS ARM64 服务端构建：</p>
+  <pre>cd /root/master\n./scripts/build_server_arm.sh</pre>
+
+  <h2>7. ECS 自启动和自动部署</h2>
+  <p>当前 ECS 工作目录为 <code>/root/master</code>，服务端使用 UDP 5060（SIP）和 UDP 40000（RTP）。systemd 单元每 30 秒检查一次 <code>include/</code>、<code>src/</code> 和构建脚本的摘要。新代码连续两次检测一致后自动使用 ECS 本机 GCC 编译；编译成功则停止旧服务并启动新服务，编译失败则保留旧版本。</p>
+  <table>
+    <tr><th>检查项</th><th>当前结果</th></tr>
+    <tr><td><code>systemctl is-enabled ptt-server-autodeploy.service</code></td><td class="ok">enabled</td></tr>
+    <tr><td><code>systemctl is-active ptt-server-autodeploy.service</code></td><td class="ok">active</td></tr>
+    <tr><td>ptt_server</td><td class="ok">正在运行</td></tr>
+    <tr><td>UDP 5060 / UDP 40000</td><td class="ok">正在监听</td></tr>
+  </table>
+  <p>查看日志：</p>
+  <pre>systemctl status ptt-server-autodeploy.service\njournalctl -u ptt-server-autodeploy.service -f -o cat\ntail -F /root/master/logs/server.log\ntail -F /root/master/logs/auto_deploy.log</pre>
+
+  <h2>8. 测试过程和结果</h2>
+  <h3>8.1 本地回归</h3>
+  <p>通过 <code>scripts/run_demo.sh</code> 启动本地服务端和三个客户端，验证了注册、入组、client_001 抢麦、client_002 申请时返回 BUSY、服务器转发给两个监听端以及释放讲话权等流程。</p>
+  <h3>8.2 ECS 公网测试</h3>
+  <p>三个 WSL 客户端连接 ECS 公网地址 <code>123.57.79.87</code>。client_001 输入 <code>talk</code> 后，服务端显示 <code>recipients=2</code>，client_002 已观察到：</p>
+  <pre>[client_002] [rx/1s] via=server packets=41 opus_payload=2050 bytes delay_ms avg=6.8 min=6 max=7 missing_timestamp=0\n[client_002] [rx/1s] via=server packets=40 opus_payload=2000 bytes delay_ms avg=6.7 min=6 max=7 missing_timestamp=0\n[client_002] [rx/1s] via=server packets=41 opus_payload=2050 bytes delay_ms avg=6.9 min=6 max=11 missing_timestamp=0\n[client_002] <- PTT-IDLE previous_speaker=client_001, state=IDLE</pre>
+  <ul>
+    <li><code>packets=40/41</code>：符合每秒 40 包，41 包是统计窗口边界和调度造成的正常现象。</li>
+    <li><code>opus_payload=2000/2050</code>：每包约 50 字节，符合模拟参数。</li>
+    <li>平均延时约 6.7~6.9 ms，最大延时大部分为 7~8 ms，偶发 11 ms。</li>
+    <li><code>missing_timestamp=0</code>：时间戳完整。</li>
+    <li><code>PTT-IDLE</code>：讲话结束和状态广播正常。</li>
+  </ul>
+  <p class="ok">阶段验收结论：PC/WSL 客户端、ECS ARM64 服务端、SIP 控制、抢麦、RTP 转发、NAT endpoint 学习、延时统计和 ECS 自启动链路已打通。</p>
+
+  <h2>9. 当前限制与风险</h2>
+  <ol>
+    <li>当前没有真实 PCM 到 Opus 的编码，音频 payload 仍为模拟二进制数据。</li>
+    <li>SIP 只实现当前场景所需子集，尚未实现完整事务重传和严格状态机。</li>
+    <li>尚未加入 SIP Digest 鉴权、TLS、SRTP、用户权限和设备权限管理。</li>
+    <li>尚未实现丢包重传、抖动缓冲和音频 PLC。</li>
+    <li>公网部署必须正确开放 UDP 5060 和 UDP 40000 安全组/防火墙规则。</li>
+    <li>真实 4G 设备之间进行单向延时测量前必须统一时钟。</li>
+    <li>Keepalive 为 10 秒，最终间隔需要结合移远模组的实际电流和 NAT 超时测量。</li>
+  </ol>
+
+  <h2>10. 下一阶段计划</h2>
+  <ol>
+    <li>接入麦克风采集和真实 Opus 编码，替换模拟 payload。</li>
+    <li>确认具体移远型号，以及采用 OpenCPU 还是外部 MCU + AT Socket 方案。</li>
+    <li>替换 Socket、定时器、GPIO 按键、音频采集和播放适配层。</li>
+    <li>增加网络断线重连、注册刷新、弱信号和服务器重启恢复测试。</li>
+    <li>测量空闲、监听、讲话三种状态的 4G 电流，优化保活和休眠策略。</li>
+    <li>增加 Digest 鉴权、设备身份校验、群组权限、TLS/SRTP 和 RTP 注入防护。</li>
+  </ol>
+
+  <h2>11. 阶段结论</h2>
+  <p>本阶段已经完成一个纯 C 的 SIP/RTP 组呼原型，并在 WSL 三客户端和 ARM64 ECS 环境完成公网链路验证。当前系统能够实现：</p>
+  <pre>客户端注册 -> 加入群组 -> 申请讲话权 -> 服务器仲裁\n-> 讲话端发送 RTP -> ECS 一对多转发\n-> 监听端接收并统计延时 -> 释放讲话权</pre>
+  <p>当前实测监听端平均延时约 7 ms，ECS 服务端 UDP 5060/40000 正常监听，自动部署服务为 enabled/active。下一阶段工作的核心是接入真实音频、完成移远模组适配、进行功耗和可靠性测试，并完成生产级安全加固。</p>
+
+  <footer>本报告对应项目仓库：<code>git@github.com:wangfengbo2020/master_sip.git</code></footer>
+</main>
+</body>
+</html>

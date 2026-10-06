@@ -1,0 +1,7 @@
+build/
+logs/
+tmp/
+*.pem
+*.key
+.env
+

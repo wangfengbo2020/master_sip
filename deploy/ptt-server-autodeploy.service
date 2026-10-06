@@ -1,0 +1,16 @@
+[Unit]
+Description=Automatic build and restart for the SIP/PTT server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/master
+Environment=POLL_INTERVAL=30
+ExecStart=/root/master/scripts/auto_deploy_server.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
