@@ -19,9 +19,9 @@ echo "Compiler: ${CC}"
 echo "Target  : $(uname -m)"
 
 "${CC}" ${CFLAGS} \
-    -I"${PROJECT_DIR}/include" \
-    "${PROJECT_DIR}/src/ptt_common.c" \
-    "${PROJECT_DIR}/src/ptt_server.c" \
+    -I"${PROJECT_DIR}/native/include" \
+    "${PROJECT_DIR}/native/src/ptt_common.c" \
+    "${PROJECT_DIR}/apps/server/ptt_server.c" \
     -o "${BUILD_DIR}/ptt_server"
 
 echo "Built   : ${BUILD_DIR}/ptt_server"

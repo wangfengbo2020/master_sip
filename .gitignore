@@ -1,7 +1,19 @@
 build/
+build-*/
 logs/
 tmp/
 *.pem
 *.key
 .env
+
+# Android/Gradle local state and build outputs
+android/.gradle/
+android/.idea/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+
+# Machine-specific diagnostic files
+*.reg
 

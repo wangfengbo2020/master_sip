@@ -209,6 +209,24 @@ client_003: PTT-IDLE previous_speaker=client_001, state=IDLE
 
 之后可以在 `client_002` 或 `client_003` 输入 `talk`，由它取得下一次讲话权。
 
+
+## Android Demo
+
+Android工程位于 `android/`，PC客户端与Android通过JNI共用 `native/` 下的C代码。
+使用Android Studio打开该目录，首次同步需要安装：
+
+- Android SDK Platform 35
+- Android SDK Build-Tools
+- NDK (Side by side)
+- CMake 3.22.1
+
+页面只要求输入组名，设备ID由Android系统ID生成，本地SIP/RTP端口由操作系统动态分配。
+连接服务端 `123.57.79.87`（SIP/UDP 5060、RTP/UDP 40000）后，可完成加入组、
+抢麦、占用提示、讲话波浪动画、释放讲话权、RTP包数和延时显示。
+
+当前Android版发送16 kbit/s、40包/秒、约50字节/包的模拟Opus负载，尚未接入麦克风采集、
+真实Opus编码、抖动缓冲、解码和扬声器播放。
+
 ## 部署到 Linux 服务端
 
 在服务端编译后运行：
@@ -240,7 +258,7 @@ PC客户端示例：
 ARM ECS 上已经提供 `scripts/auto_deploy_server.sh` 和
 `deploy/ptt-server-autodeploy.service`。systemd 服务启动后会：
 
-1. 每 30 秒计算 `include/`、`src/` 和 `scripts/build_server_arm.sh` 的哈希。
+1. 每 30 秒计算 `native/include/`、`native/src/`、`apps/server/` 和 `scripts/build_server_arm.sh` 的哈希。
 2. 检测到新代码后，等待连续两次轮询结果一致，再使用 ECS 本机 GCC 编译。
 3. 编译成功后停止旧的 `ptt_server` 并启动新版本；编译失败时保留正在运行的旧版本。
 4. 如果服务进程异常退出，下一次轮询会自动重新启动。
@@ -261,10 +279,12 @@ systemctl status ptt-server-autodeploy.service
 
 ## 代码入口
 
-- `src/ptt_server.c`：注册表、群组、讲话权以及RTP一对多转发。
-- `src/ptt_client.c`：SIP客户端状态机、按键命令和RTP收发。
-- `src/ptt_common.c`：SIP头解析和RTP封装/解析。
-- `include/ptt_common.h`：公共接口。
+- `apps/server/ptt_server.c`：注册表、群组、讲话权以及RTP一对多转发。
+- `apps/pc/ptt_client_main.c`：PC命令行外壳。
+- `native/src/ptt_client.c`：可复用的SIP客户端状态机和RTP收发。
+- `native/src/ptt_common.c`：SIP头解析和RTP封装/解析。
+- `native/include/ptt_client.h`、`native/include/ptt_common.h`：公共接口。
+- `android/`：调用相同C核心的Android Studio工程。
 
 ## 移植到移远4G模组
 
@@ -288,4 +308,3 @@ systemctl status ptt-server-autodeploy.service
 - `receive_rtp()`：把收到的payload送入解码和播放缓冲区。
 
 正式移植前需要确定移远模组的准确型号，以及采用模组OpenCPU运行程序，还是外部MCU通过UART/USB控制模组。
-

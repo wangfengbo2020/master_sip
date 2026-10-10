@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SIP 与 RTP 协议介绍——面向 4G PTT 集群对讲</title>
+  <style>
+    :root {
+      --navy:#16324f;
+      --blue:#1f6fb2;
+      --cyan:#0f91a8;
+      --green:#247a52;
+      --orange:#a65c00;
+      --red:#ad3540;
+      --ink:#253443;
+      --muted:#607181;
+      --line:#d7e0e8;
+      --paper:#ffffff;
+      --page:#edf2f6;
+      --soft:#f5f8fb;
+      --sip:#eaf3ff;
+      --rtp:#eaf9f3;
+    }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body {
+      margin:0;
+      color:var(--ink);
+      background:var(--page);
+      font-family:"Microsoft YaHei","PingFang SC","Noto Sans CJK SC",Arial,sans-serif;
+      line-height:1.72;
+    }
+    main {
+      max-width:1120px;
+      margin:28px auto;
+      padding:44px 54px 52px;
+      background:var(--paper);
+      box-shadow:0 4px 24px rgba(18,45,70,.10);
+    }
+    h1 { margin:0; color:var(--navy); font-size:32px; line-height:1.35; }
+    h2 {
+      margin:38px 0 14px;
+      padding-bottom:7px;
+      color:var(--navy);
+      font-size:23px;
+      border-bottom:2px solid #dbe6ef;
+    }
+    h3 { margin:24px 0 8px; color:#285f8a; font-size:18px; }
+    p { margin:8px 0 13px; }
+    a { color:var(--blue); }
+    code {
+      padding:2px 5px;
+      background:#eef2f5;
+      border-radius:4px;
+      font-family:Consolas,"Courier New",monospace;
+    }
+    pre {
+      margin:13px 0 18px;
+      padding:16px 19px;
+      overflow:auto;
+      color:#eaf3fa;
+      background:#172838;
+      border-radius:7px;
+      line-height:1.5;
+      font-family:Consolas,"Courier New",monospace;
+    }
+    table { width:100%; margin:13px 0 21px; border-collapse:collapse; }
+    th, td { padding:9px 11px; border:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--navy); background:#eef4f8; }
+    ul, ol { padding-left:24px; }
+    li { margin:5px 0; }
+    .meta { margin:8px 0 0; color:var(--muted); }
+    .lead {
+      margin:24px 0;
+      padding:17px 20px;
+      background:linear-gradient(100deg,#eaf3ff,#eefaf8);
+      border-left:5px solid var(--blue);
+      border-radius:3px;
+    }
+    .toc {
+      margin:22px 0 28px;
+      padding:16px 20px;
+      background:var(--soft);
+      border:1px solid var(--line);
+      border-radius:7px;
+    }
+    .toc strong { color:var(--navy); }
+    .toc a { margin-right:17px; white-space:nowrap; text-decoration:none; }
+    .cards { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:17px 0; }
+    .card { padding:18px 20px; border:1px solid var(--line); border-radius:8px; }
+    .card h3 { margin-top:0; }
+    .card.sip { background:var(--sip); border-top:4px solid var(--blue); }
+    .card.rtp { background:var(--rtp); border-top:4px solid var(--green); }
+    .note, .warning, .good {
+      margin:16px 0;
+      padding:13px 16px;
+      border-radius:5px;
+    }
+    .note { background:#edf6ff; border-left:4px solid var(--blue); }
+    .warning { background:#fff6e6; border-left:4px solid var(--orange); }
+    .good { background:#ebf8f0; border-left:4px solid var(--green); }
+    .flow {
+      display:flex;
+      flex-wrap:wrap;
+      align-items:stretch;
+      gap:8px;
+      margin:17px 0 22px;
+    }
+    .step {
+      flex:1 1 130px;
+      min-width:130px;
+      padding:12px 10px;
+      text-align:center;
+      background:#f7fafc;
+      border:1px solid var(--line);
+      border-radius:6px;
+    }
+    .step b { display:block; color:var(--navy); }
+    .arrow { align-self:center; color:var(--blue); font-size:22px; font-weight:bold; }
+    .tag { display:inline-block; padding:1px 7px; border-radius:11px; font-size:12px; font-weight:bold; }
+    .tag.sip { color:#155b92; background:#dceeff; }
+    .tag.rtp { color:#176b48; background:#d9f3e7; }
+    .tag.todo { color:#8c5100; background:#ffebc2; }
+    .mono { font-family:Consolas,"Courier New",monospace; }
+    .small { color:var(--muted); font-size:13px; }
+    footer { margin-top:40px; padding-top:15px; color:var(--muted); border-top:1px solid var(--line); font-size:13px; }
+    @media (max-width:760px) {
+      main { margin:0; padding:28px 20px; }
+      h1 { font-size:26px; }
+      .cards { grid-template-columns:1fr; }
+      .arrow { display:none; }
+    }
+    @media print {
+      @page { size:A4; margin:14mm; }
+      body { background:#fff; font-size:10.5pt; }
+      main { max-width:none; margin:0; padding:0; box-shadow:none; }
+      h2, h3 { break-after:avoid; }
+      table, pre, .card, .note, .warning, .good { break-inside:avoid; }
+      a { color:inherit; text-decoration:none; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>SIP 与 RTP 协议介绍</h1>
+  <p class="meta">面向 4G PTT 集群对讲系统 · 版本 1.0 · 2026-10-08</p>
+
+  <div class="lead">
+    <strong>一句话理解：</strong>SIP 负责“谁加入、谁讲话、什么时候停止”等控制；RTP 负责持续传输 Opus 音频。SIP 类似呼叫调度员，RTP 类似真正承载声音的运输通道。
+  </div>
+
+  <nav class="toc">
+    <strong>目录：</strong>
+    <a href="#overview">总体概念</a>
+    <a href="#sip">SIP</a>
+    <a href="#rtp">RTP</a>
+    <a href="#flow">PTT流程</a>
+    <a href="#ports">端口与NAT</a>
+    <a href="#audio">音频与带宽</a>
+    <a href="#latency">时延与缓存</a>
+    <a href="#security">安全加密</a>
+    <a href="#power">低功耗</a>
+  </nav>
+
+  <h2 id="overview">1. SIP 与 RTP 的总体关系</h2>
+  <div class="cards">
+    <section class="card sip">
+      <h3>SIP：信令控制平面</h3>
+      <p>完成注册、入组、抢麦、释放讲话权和状态通知。SIP 消息通常是可读文本，当前项目通过 UDP 传输。</p>
+      <p><span class="tag sip">控制数据</span> 数据量小，可靠性和状态一致性重要。</p>
+    </section>
+    <section class="card rtp">
+      <h3>RTP：实时媒体平面</h3>
+      <p>承载 Opus 编码后的音频包，包含序号、时间戳、SSRC 和 Payload Type。当前项目通过 UDP 传输。</p>
+      <p><span class="tag rtp">音频数据</span> 数据连续，低延时比单包可靠性更重要。</p>
+    </section>
+  </div>
+
+  <table>
+    <tr><th>比较项</th><th>SIP</th><th>RTP</th></tr>
+    <tr><td>主要职责</td><td>会话、设备、群组和讲话权控制</td><td>实时传输音频</td></tr>
+    <tr><td>当前传输层</td><td>UDP</td><td>UDP</td></tr>
+    <tr><td>数据形式</td><td>文本报文</td><td>二进制报文</td></tr>
+    <tr><td>数据频率</td><td>状态变化时发送</td><td>讲话期间约 40 包/秒</td></tr>
+    <tr><td>丢包影响</td><td>可能造成状态不一致，需要应答和重传</td><td>通常表现为短促音频缺失，不宜等待长时间重传</td></tr>
+    <tr><td>是否直接携带声音</td><td>否</td><td>是，承载 Opus payload</td></tr>
+  </table>
+
+  <h2 id="sip">2. SIP 协议介绍</h2>
+  <p>SIP（Session Initiation Protocol，会话初始协议）是应用层信令协议。标准 SIP 可用于建立、修改和结束语音或视频会话；在本项目中，仅实现 PTT 场景需要的轻量子集。</p>
+
+  <h3>2.1 当前项目使用的 SIP 消息</h3>
+  <table>
+    <tr><th>消息</th><th>方向</th><th>作用</th></tr>
+    <tr><td><code>REGISTER</code></td><td>客户端 → 服务端</td><td>设备注册，提交设备 ID 和本地 RTP 接收端口</td></tr>
+    <tr><td><code>INVITE</code></td><td>客户端 → 服务端</td><td>加入指定群组，例如 <code>group_01</code></td></tr>
+    <tr><td><code>ACK</code></td><td>客户端 → 服务端</td><td>确认 INVITE 的成功响应</td></tr>
+    <tr><td><code>MESSAGE / PTT-REQUEST</code></td><td>客户端 → 服务端</td><td>申请讲话权</td></tr>
+    <tr><td><code>MESSAGE / PTT-RELEASE</code></td><td>客户端 → 服务端</td><td>释放讲话权</td></tr>
+    <tr><td><code>MESSAGE / PTT-LISTEN</code></td><td>服务端 → 监听端</td><td>通知某个客户端开始讲话</td></tr>
+    <tr><td><code>MESSAGE / PTT-IDLE</code></td><td>服务端 → 监听端</td><td>通知讲话结束，恢复空闲状态</td></tr>
+    <tr><td><code>BYE</code></td><td>客户端 → 服务端</td><td>退出群组和结束当前会话</td></tr>
+  </table>
+
+  <h3>2.2 简化的抢麦报文示例</h3>
+  <pre>MESSAGE sip:group-group_01@123.57.79.87 SIP/2.0
+From: &lt;sip:client_001@device&gt;
+To: &lt;sip:group-group_01@server&gt;
+X-Device-ID: client_001
+X-Group-ID: group_01
+Content-Type: application/x-ptt
+Content-Length: 11
+
+PTT-REQUEST</pre>
+  <p>服务端如果发现群组当前无人讲话，则返回 <code>X-PTT-Result: GRANTED</code>；如果已有讲话者，则返回 <code>BUSY</code> 和当前讲话者 ID。</p>
+
+  <div class="warning">
+    <strong>当前原型限制：</strong>尚未实现完整 SIP UDP 事务重传。服务端的 <code>PTT-LISTEN</code> 或 <code>PTT-IDLE</code> 如果丢失，客户端可能暂时停留在错误状态。生产版本应保存待确认事务，根据 Call-ID/CSeq 等待 <code>200 OK</code>，超时后重传，并让客户端能够幂等处理重复消息。
+  </div>
+
+  <h2 id="rtp">3. RTP 协议介绍</h2>
+  <p>RTP（Real-time Transport Protocol，实时传输协议）用于在 IP 网络中传送实时音频或视频。RTP 通常运行在 UDP 之上，本身不保证报文一定到达、不保证按序到达，也不负责重传。</p>
+
+  <h3>3.1 RTP 头部中的关键字段</h3>
+  <table>
+    <tr><th>字段</th><th>作用</th><th>本项目用途</th></tr>
+    <tr><td>Payload Type</td><td>说明负载类型</td><td><code>111</code> 表示 Opus；<code>126</code> 用作 NAT Keepalive</td></tr>
+    <tr><td>Sequence Number</td><td>每发一个包递增，用于发现丢包和乱序</td><td>16 位，40 包/秒时约 27 分钟回绕一次</td></tr>
+    <tr><td>Timestamp</td><td>表示音频采样时间位置</td><td>按 48 kHz 时钟，每 25 ms 增加 1200</td></tr>
+    <tr><td>SSRC</td><td>标识一个 RTP 数据源</td><td>帮助服务器识别设备并学习 NAT 后的实际端点</td></tr>
+    <tr><td>扩展头</td><td>携带业务自定义信息</td><td>当前携带 64 位 Unix 毫秒发送时间戳</td></tr>
+    <tr><td>Payload</td><td>真正的媒体数据</td><td>当前为约 50 字节的模拟 Opus 二进制负载</td></tr>
+  </table>
+
+  <pre>RTP packet
+┌──────────── 标准 RTP 头：12 bytes ────────────┐
+│ V/PT │ Sequence │ Timestamp │ SSRC            │
+├──────────── 项目扩展头：12 bytes ─────────────┤
+│ Profile/Length │ Unix send_time_ms：8 bytes   │
+├──────────── Opus payload：约 50 bytes ────────┤
+│ 编码后的音频数据                              │
+└───────────────────────────────────────────────┘</pre>
+
+  <p>RTCP 通常与 RTP 配套，用于上报丢包率、抖动和往返时间。当前项目没有实现 RTCP，而是由监听端每秒直接统计收到的 RTP 包数和单向延时。</p>
+
+  <h2 id="flow">4. 三客户端 PTT 完整流程</h2>
+  <div class="flow">
+    <div class="step"><b>1. 注册</b>REGISTER</div><div class="arrow">→</div>
+    <div class="step"><b>2. 入组</b>INVITE</div><div class="arrow">→</div>
+    <div class="step"><b>3. 抢麦</b>PTT-REQUEST</div><div class="arrow">→</div>
+    <div class="step"><b>4. 讲话</b>RTP/Opus</div><div class="arrow">→</div>
+    <div class="step"><b>5. 释放</b>PTT-RELEASE</div>
+  </div>
+
+  <pre>client_001                 PTT Server               client_002 / client_003
+    | REGISTER                 |                              |
+    |------------------------->|                              |
+    | 200 OK                   |                              |
+    |<-------------------------|                              |
+    | INVITE group_01          |                              |
+    |------------------------->|                              |
+    | 200 OK                   |                              |
+    |<-------------------------|                              |
+    |                          |       其他客户端同样注册入组  |
+    | PTT-REQUEST              |                              |
+    |------------------------->|                              |
+    |                          |-------- PTT-LISTEN ---------->|
+    | GRANTED                  |                              |
+    |<-------------------------|                              |
+    | RTP/Opus 40 packets/s    |                              |
+    |------------------------->|---------- RTP copy ---------->|
+    | PTT-RELEASE              |                              |
+    |------------------------->|                              |
+    |                          |---------- PTT-IDLE ----------->|
+    | RELEASED                 |                              |
+    |<-------------------------|                              |</pre>
+
+  <p>服务端为每个群组维护一个讲话权所有者。同一时间只有所有者发送的 Opus RTP 包可以被转发；其他客户端申请时得到 <code>BUSY</code>。</p>
+
+  <h2 id="ports">5. 端口、IP 与 NAT</h2>
+  <h3>5.1 当前测试端口</h3>
+  <table>
+    <tr><th>节点</th><th>SIP 本地端口</th><th>RTP 本地端口</th></tr>
+    <tr><td>client_001</td><td>15071</td><td>20001</td></tr>
+    <tr><td>client_002</td><td>15072</td><td>20002</td></tr>
+    <tr><td>client_003</td><td>15073</td><td>20003</td></tr>
+    <tr><td>ECS 服务端</td><td>5060</td><td>40000</td></tr>
+  </table>
+
+  <p>三个客户端运行在同一个 WSL IP 上，因此 SIP 和 RTP 本地端口都必须不同。UDP 数据先依据“目标 IP + 目标端口”交给进程，RTP 的 SSRC 只有在进程收到数据后才能解析，不能替代端口区分。</p>
+  <p>三台独立的真实设备具有不同本地 IP 时，可以都使用相同的本地 RTP 端口，例如各自使用 <code>20001</code>。经过 4G 运营商 NAT 后，服务端以实际观察到的公网 <code>IP:port</code> 为准。</p>
+
+  <h3>5.2 NAT 地址学习</h3>
+  <p>客户端入组后从自己的 RTP socket 发送 Keepalive。服务端根据该 UDP 包的源地址和 SSRC 更新实际 RTP 返回地址。讲话期间，正常 RTP 包继续维持 NAT 映射。</p>
+  <div class="note">
+    SIP 报文中声明的 WSL 私网地址可能对 ECS 不可达，因此服务端不能只相信报文里的地址，必须使用实际收到数据包的公网源地址。当前 Keepalive 间隔为 10 秒，最终产品需要根据运营商 NAT 超时时间和实测电流调整。
+  </div>
+
+  <h3>5.3 群组是否需要独立端口</h3>
+  <p><strong>不需要为每个群组分配独立的 SIP 和 RTP 端口。</strong>群组由 <code>group_id</code>、设备身份和服务端群组状态表区分，端口只用于把 UDP 数据交给 SIP 服务或 RTP 服务。</p>
+  <pre>group_01 ─┐
+group_02 ─┼── SIP → ECS UDP 5060
+group_03 ─┘
+
+所有讲话设备 ─── RTP → ECS UDP 40000
+服务端根据设备会话、SSRC 和 group_id 转发到正确群组</pre>
+  <p>生产环境建议采用以下分配方式：</p>
+  <table>
+    <tr><th>端口类型</th><th>由谁分配</th><th>建议</th></tr>
+    <tr><td>服务端 SIP 端口</td><td>平台运维或服务端配置</td><td>固定端口；常见为 5060，使用 SIP/TLS 时常见为 5061</td></tr>
+    <tr><td>服务端 RTP 端口</td><td>媒体服务配置或媒体调度器</td><td>当前可以固定使用 40000；扩容时由服务端从端口池或不同媒体节点分配</td></tr>
+    <tr><td>客户端本地端口</td><td>设备操作系统、模组 Socket 层或客户端程序</td><td>真实设备建议动态分配；同一 IP 上的多个客户端必须避免冲突</td></tr>
+    <tr><td>NAT 后的公网端口</td><td>4G 运营商、路由器或 NAT 网关</td><td>设备无法指定，服务端通过实际收到的数据包和 Keepalive 学习</td></tr>
+    <tr><td>群组 ID</td><td>业务平台或设备管理后台</td><td>使用逻辑 ID 管理，不与 UDP 端口绑定</td></tr>
+  </table>
+  <p>如果未来并发量很大，可以把不同群组调度到不同 RTP 端口或不同媒体服务器，但这是扩容和负载均衡策略，不是 SIP/RTP 协议要求。具体端口应由服务端在入组响应或 SDP 中下发，客户端不应自行决定或为每个群组硬编码端口。</p>
+  <div class="warning">
+    端口不能作为群组隔离或安全机制。即使所有群组共用同一个 RTP 端口，也必须根据已认证的设备身份、会话、讲话权和群组权限决定是否接收和转发数据。
+  </div>
+
+  <h2 id="audio">6. Opus 音频与带宽</h2>
+  <table>
+    <tr><th>项目</th><th>当前参数</th></tr>
+    <tr><td>编码格式</td><td>目标为单声道 Opus；PC 原型当前使用模拟二进制 payload</td></tr>
+    <tr><td>目标码率</td><td>16 kbit/s</td></tr>
+    <tr><td>RTP 包率</td><td>40 包/秒</td></tr>
+    <tr><td>传输间隔</td><td>25 ms/包</td></tr>
+    <tr><td>Opus payload</td><td>约 50 字节/包</td></tr>
+    <tr><td>RTP 时钟</td><td>48 kHz</td></tr>
+  </table>
+
+  <div class="warning">
+    <strong>Opus 帧长说明：</strong>25 ms 不是常见的单个 Opus 帧长。真实编码接入时，可以把 5 个 5 ms Opus 帧聚合到一个 25 ms RTP 包；如果编码器只输出常见的 20 ms 帧，建议调整为 50 包/秒。
+  </div>
+
+  <pre>Opus payload： 50 bytes × 40 = 2000 bytes/s = 16.00 kbit/s
+RTP及扩展头： 24 bytes/packet
+UDP + IPv4：  28 bytes/packet
+合计：        102 bytes × 40 × 8 = 32.64 kbit/s
+单向连续媒体：约 14.01 MiB/hour</pre>
+
+  <p>三人组一人讲话、两人监听时，讲话设备上行约 32.64 kbit/s，每个监听设备下行约 32.64 kbit/s，服务端把一路上行复制成两路下行。</p>
+
+  <h2 id="latency">7. 时延、缓存和丢包</h2>
+  <h3>7.1 延时统计</h3>
+  <p>讲话端把发送时刻写入 RTP 扩展头，服务端保持报文不变地转发，监听端使用“接收时间减发送时间”计算端到端单向延时，并每秒输出平均值、最小值和最大值。</p>
+  <pre>[client_002] [rx/1s] via=server packets=40 opus_payload=2000 bytes
+delay_ms avg=5.4 min=5 max=6 missing_timestamp=0</pre>
+  <p>不同真实设备测量单向延时前必须进行时钟同步，否则结果会包含两台设备的时钟误差。</p>
+
+  <h3>7.2 服务端是否缓存音频</h3>
+  <p>当前服务端没有应用层音频缓存。它每次读取一个 RTP 包，完成校验后立即调用 <code>sendto()</code> 转发，然后复用同一个临时缓冲区。不存在录音、历史回放、多包排队、重排序或媒体重传。</p>
+  <ul>
+    <li>优点：内存占用小、处理路径短、转发延时低。</li>
+    <li>限制：UDP 包丢失后不会恢复；乱序和网络抖动需要监听端处理。</li>
+  </ul>
+  <p>真实音频播放端建议从 3～4 个包的抖动缓冲开始，即约 75～100 ms，再根据4G网络测试结果做自适应调整。抖动缓冲应主要放在客户端，而不是服务端。</p>
+
+  <h2 id="security">8. 鉴权与加密建议</h2>
+  <h3>8.1 SIP 信令</h3>
+  <p>生产版本至少需要设备身份认证、消息完整性校验和重放保护。标准方案可以使用 SIP over TLS；低功耗 UDP 方案可以使用每设备独立 PSK，并为消息增加 HMAC-SHA256、时间戳和单调递增计数器。</p>
+
+  <h3>8.2 RTP 音频</h3>
+  <p>推荐采用 SRTP，并优先选择 AES-128-GCM。服务端可以终止上行 SRTP，验证并解密后，再使用各监听设备的独立会话密钥重新加密。这样便于单设备撤销、密钥轮换和权限管理。</p>
+  <ul>
+    <li>不要只加密而不认证；应使用 AES-GCM 或 ChaCha20-Poly1305 等 AEAD 算法。</li>
+    <li>同一个密钥下绝不能重复使用 Nonce。不能只使用会回绕的16位 RTP 序号生成 Nonce。</li>
+    <li>设备长期密钥不得硬编码在公共固件中，应使用安全存储并为每台设备配置独立密钥。</li>
+    <li>不要自行实现 AES/GCM 算法，优先使用移远 SDK、芯片硬件加密接口或经过审计的密码库。</li>
+  </ul>
+  <p>使用16字节认证标签时，每路增加约 5.12 kbit/s，即约 2.20 MiB/小时，当前单向媒体带宽将从约 32.64 kbit/s 增加到约 37.76 kbit/s。</p>
+
+  <h2 id="power">9. 4G 设备低功耗重点</h2>
+  <ol>
+    <li><strong>无线状态优先：</strong>LTE 发射和 RRC 保持的功耗通常远高于 SIP/RTP 解析及一次 AES 运算。</li>
+    <li><strong>控制 Keepalive：</strong>过于频繁的 UDP 保活可能让模组长期不能进入低功耗状态。需要实测不同运营商的 NAT 映射保持时间。</li>
+    <li><strong>监听可达性与休眠取舍：</strong>设备越深度休眠，越难及时收到服务器的 PTT-LISTEN；需要在呼入时延和电池寿命之间确定产品指标。</li>
+    <li><strong>优先硬件加密：</strong>有 AES 加速时优先 AES-GCM；无 AES 加速时可测试 ChaCha20-Poly1305 的执行时间和电流。</li>
+    <li><strong>避免无意义重传音频：</strong>实时对讲中，过期语音包通常直接丢弃比延迟播放更合理；控制信令则必须确认和重传。</li>
+  </ol>
+
+  <h2>10. 当前实现与生产版本差距</h2>
+  <table>
+    <tr><th>能力</th><th>当前原型</th><th>生产版本建议</th></tr>
+    <tr><td>SIP事务</td><td>基础请求/响应</td><td>超时、重传、去重、注册刷新</td></tr>
+    <tr><td>媒体</td><td>模拟 Opus payload</td><td>真实采集、Opus编解码、播放</td></tr>
+    <tr><td>音频缓冲</td><td>服务端直接转发</td><td>客户端自适应抖动缓冲与 PLC</td></tr>
+    <tr><td>媒体统计</td><td>包数和单向延时</td><td>增加丢包率、乱序、抖动和 RTCP</td></tr>
+    <tr><td>安全</td><td>明文 SIP/RTP</td><td>设备鉴权、TLS/HMAC、SRTP、密钥轮换</td></tr>
+    <tr><td>弱网恢复</td><td>基础 NAT Keepalive</td><td>断线重连、重新注册、端点变化恢复</td></tr>
+    <tr><td>功耗</td><td>固定 10 秒保活</td><td>按运营商、业务状态和实测电流优化</td></tr>
+  </table>
+
+  <h2>11. 总结</h2>
+  <div class="good">
+    SIP 和 RTP 在对讲系统中分工清晰：SIP 保证群组和讲话权状态正确，RTP 以尽可能低的延时传送 Opus 音频。当前原型已经验证“三客户端注册入组、单讲话者仲裁、ECS 一对多转发、毫秒级延时统计和 NAT 端点学习”。下一阶段重点是信令可靠性、真实 Opus 音频、客户端抖动缓冲、加密鉴权以及移远模组功耗测试。
+  </div>
+
+  <footer>
+    项目代码：<a href="https://github.com/wangfengbo2020/master_sip">https://github.com/wangfengbo2020/master_sip</a><br>
+    本文档对应当前 PC/WSL 客户端与 ARM64 ECS 服务端原型，标准 SIP/RTP 的完整实现范围大于本文档描述的项目子集。
+  </footer>
+</main>
+</body>
+</html>

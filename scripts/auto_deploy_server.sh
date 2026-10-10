@@ -36,7 +36,7 @@ log() {
 source_digest() {
     (
         cd "${PROJECT_DIR}"
-        find include src -type f -print0 | sort -z | xargs -0 sha256sum
+        find native/include native/src apps/server -type f -print0 | sort -z | xargs -0 sha256sum
         sha256sum scripts/build_server_arm.sh
     ) | sha256sum | awk '{print $1}'
 }
