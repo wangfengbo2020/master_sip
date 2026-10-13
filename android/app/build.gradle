@@ -6,12 +6,16 @@ android {
     namespace 'com.master.sipptt'
     compileSdk 35
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId 'com.master.sipptt'
         minSdk 24
         targetSdk 35
-        versionCode 1
-        versionName '1.0'
+        versionCode 3
+        versionName '1.1.1'
 
         externalNativeBuild {
             cmake {

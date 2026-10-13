@@ -17,7 +17,7 @@ final class AudioEngine {
     private static final int PLAYBACK_RATE = 8000;
     private static final int CAPTURE_SAMPLES = 960;
     private static final int PLAYBACK_SAMPLES = 160;
-    private static final long PLAYBACK_IDLE_CLOSE_MS = 500L;
+    private static final long PLAYBACK_IDLE_CLOSE_MS = 1000L;
 
     private volatile boolean running;
     private volatile boolean talking;
@@ -40,15 +40,26 @@ final class AudioEngine {
     }
 
     synchronized void stop() {
+        long startedAt;
+
         if (!running) {
             return;
         }
+        startedAt = SystemClock.elapsedRealtime();
         running = false;
         talking = false;
+        if (captureThread != null) {
+            captureThread.interrupt();
+        }
+        if (playbackThread != null) {
+            playbackThread.interrupt();
+        }
         joinQuietly(captureThread);
         joinQuietly(playbackThread);
         captureThread = null;
         playbackThread = null;
+        Log.i(TAG, "audio engine stopped elapsed_ms=" +
+                (SystemClock.elapsedRealtime() - startedAt));
     }
 
     private void captureLoop() {
@@ -65,6 +76,16 @@ final class AudioEngine {
                 sleepQuietly(250L);
                 continue;
             }
+            long statsStartedAt = SystemClock.elapsedRealtime();
+            long statsFrames = 0L;
+            long statsSamples = 0L;
+            long statsReadCalls = 0L;
+            long statsShortReads = 0L;
+            long statsReadErrors = 0L;
+            long statsNativeAccepted = 0L;
+            long statsNativeRejected = 0L;
+            long statsAbsoluteSum = 0L;
+            int statsPeak = 0;
             try {
                 recorder.startRecording();
                 Log.i(TAG, String.format(Locale.US,
@@ -74,16 +95,7 @@ final class AudioEngine {
                         CAPTURE_SAMPLES * 1000.0 / CAPTURE_RATE,
                         recorder.getAudioSessionId(),
                         recorder.getBufferSizeInFrames()));
-                long statsStartedAt = SystemClock.elapsedRealtime();
-                long statsFrames = 0L;
-                long statsSamples = 0L;
-                long statsReadCalls = 0L;
-                long statsShortReads = 0L;
-                long statsReadErrors = 0L;
-                long statsNativeAccepted = 0L;
-                long statsNativeRejected = 0L;
-                long statsAbsoluteSum = 0L;
-                int statsPeak = 0;
+                long captureFrameId = 0L;
                 while (running && talking) {
                     int filled = 0;
                     while (running && talking && filled < frame.length) {
@@ -105,6 +117,7 @@ final class AudioEngine {
                         filled += read;
                     }
                     if (filled == frame.length) {
+                        long captureTimeMs = System.currentTimeMillis();
                         for (short sample : frame) {
                             int value = sample;
                             int absolute = value < 0 ? -value : value;
@@ -115,11 +128,15 @@ final class AudioEngine {
                         }
                         statsFrames++;
                         statsSamples += frame.length;
-                        if (NativePtt.nativePushCapturePcm(frame, frame.length)) {
+                        if (NativePtt.nativePushCapturePcm(frame,
+                                frame.length,
+                                captureFrameId,
+                                captureTimeMs)) {
                             statsNativeAccepted++;
                         } else {
                             statsNativeRejected++;
                         }
+                        captureFrameId++;
                     }
 
                     long now = SystemClock.elapsedRealtime();
@@ -128,9 +145,10 @@ final class AudioEngine {
                                 ? (double) statsAbsoluteSum / statsSamples
                                 : 0.0;
                         Log.i(TAG, String.format(Locale.US,
-                                "[capture-tx/1s] frames=%d samples=%d read_calls=%d " +
+                                "[capture-tx/1s] duration_ms=%d frames=%d samples=%d read_calls=%d " +
                                         "short_reads=%d read_errors=%d pcm_level avg_abs=%.1f peak=%d " +
                                         "native_accepted=%d native_rejected=%d",
+                                now - statsStartedAt,
                                 statsFrames,
                                 statsSamples,
                                 statsReadCalls,
@@ -155,11 +173,34 @@ final class AudioEngine {
             } catch (IllegalStateException exception) {
                 Log.e(TAG, "capture state failure", exception);
             } finally {
+                long stoppedAt = SystemClock.elapsedRealtime();
+                if (statsFrames > 0L || statsReadCalls > 0L ||
+                        statsReadErrors > 0L || statsNativeRejected > 0L) {
+                    double averageAbsolute = statsSamples > 0
+                            ? (double) statsAbsoluteSum / statsSamples
+                            : 0.0;
+                    Log.i(TAG, String.format(Locale.US,
+                            "[capture-tx/final] duration_ms=%d frames=%d samples=%d " +
+                                    "read_calls=%d short_reads=%d read_errors=%d " +
+                                    "pcm_level avg_abs=%.1f peak=%d " +
+                                    "native_accepted=%d native_rejected=%d",
+                            stoppedAt - statsStartedAt,
+                            statsFrames,
+                            statsSamples,
+                            statsReadCalls,
+                            statsShortReads,
+                            statsReadErrors,
+                            averageAbsolute,
+                            statsPeak,
+                            statsNativeAccepted,
+                            statsNativeRejected));
+                }
                 try {
                     recorder.stop();
                 } catch (IllegalStateException ignored) {
                 }
                 recorder.release();
+                NativePtt.nativeFlushTxDiagnostics("capture-stop");
                 Log.i(TAG, "capture stopped");
             }
         }
@@ -170,6 +211,11 @@ final class AudioEngine {
         short[] pcm = new short[PLAYBACK_SAMPLES];
         AudioTrack track = null;
         long lastAudioAt = 0L;
+        long statsStartedAt = SystemClock.elapsedRealtime();
+        long statsWrites = 0L;
+        long statsSamples = 0L;
+        long statsEmptyPolls = 0L;
+        int statsUnderrunStart = 0;
 
         while (running) {
             int samples = NativePtt.nativeReadPlaybackPcm(pcm, pcm.length);
@@ -180,10 +226,23 @@ final class AudioEngine {
                         continue;
                     }
                     track.play();
+                    statsUnderrunStart = track.getUnderrunCount();
+                    Log.i(TAG, String.format(Locale.US,
+                            "playback started rate=%dHz buffer_frames=%d session=%d",
+                            track.getSampleRate(),
+                            track.getBufferSizeInFrames(),
+                            track.getAudioSessionId()));
                 }
-                track.write(pcm, 0, samples, AudioTrack.WRITE_BLOCKING);
+                int written = track.write(pcm, 0, samples, AudioTrack.WRITE_BLOCKING);
+                if (written > 0) {
+                    statsWrites++;
+                    statsSamples += written;
+                }
                 lastAudioAt = android.os.SystemClock.elapsedRealtime();
             } else {
+                if (track != null) {
+                    statsEmptyPolls++;
+                }
                 if (track != null &&
                         android.os.SystemClock.elapsedRealtime() - lastAudioAt >=
                                 PLAYBACK_IDLE_CLOSE_MS) {
@@ -191,6 +250,22 @@ final class AudioEngine {
                     track = null;
                 }
                 sleepQuietly(5L);
+            }
+            long now = SystemClock.elapsedRealtime();
+            if (track != null && now - statsStartedAt >= 1000L) {
+                Log.i(TAG, String.format(Locale.US,
+                        "[playback/1s] writes=%d samples=%d empty_polls=%d " +
+                                "platform_underruns=%d buffer_frames=%d",
+                        statsWrites,
+                        statsSamples,
+                        statsEmptyPolls,
+                        Math.max(0, track.getUnderrunCount() - statsUnderrunStart),
+                        track.getBufferSizeInFrames()));
+                statsStartedAt = now;
+                statsWrites = 0L;
+                statsSamples = 0L;
+                statsEmptyPolls = 0L;
+                statsUnderrunStart = track.getUnderrunCount();
             }
         }
         if (track != null) {

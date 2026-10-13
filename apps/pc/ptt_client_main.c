@@ -213,13 +213,22 @@ int main(int argc, char **argv)
         if (audio != NULL) {
             uint8_t opus_packet[PTT_OPUS_MAX_PACKET_BYTES];
             size_t opus_length;
+            uint32_t source_frame_id;
+            uint64_t capture_time_ms;
 
             ptt_pc_audio_set_talking(audio, snapshot.mode == PTT_CLIENT_TALKING);
             while (ptt_pc_audio_take_opus(audio,
                                           opus_packet,
                                           sizeof(opus_packet),
-                                          &opus_length)) {
-                (void)ptt_client_send_opus(client, opus_packet, opus_length);
+                                           &opus_length,
+                                           &source_frame_id,
+                                           &capture_time_ms)) {
+                (void)ptt_client_send_opus_frame(client,
+                                                 opus_packet,
+                                                 opus_length,
+                                                 source_frame_id,
+                                                 capture_time_ms,
+                                                 NULL);
             }
         }
         now = ptt_now_ms();

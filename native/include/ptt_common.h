@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define PTT_PRODUCT_VERSION "1.1.1"
 #define PTT_MAX_SIP_PACKET 4096
 #define PTT_MAX_RTP_PACKET 1500
 #define PTT_MAX_ID 64
@@ -17,6 +18,7 @@
 #define PTT_OPUS_TIMESTAMP_STEP 960u
 #define PTT_RTP_SEND_TIME_PROFILE 0x5054u
 #define PTT_RTP_HEADER_WITH_SEND_TIME 24u
+#define PTT_RTP_HEADER_WITH_FRAME_METADATA 36u
 
 typedef struct {
     uint8_t payload_type;
@@ -26,6 +28,10 @@ typedef struct {
     uint32_t ssrc;
     int has_send_time_ms;
     uint64_t send_time_ms;
+    int has_source_frame_id;
+    uint32_t source_frame_id;
+    int has_capture_time_ms;
+    uint64_t capture_time_ms;
     size_t header_length;
     const uint8_t *payload;
     size_t payload_length;
@@ -58,6 +64,25 @@ size_t ptt_build_rtp(uint8_t *packet,
                      uint64_t send_time_ms,
                      const uint8_t *payload,
                      size_t payload_length);
+
+/*
+ * Extended private RTP metadata used by the diagnostic build.  The source
+ * frame id is assigned immediately after one 20 ms microphone frame has been
+ * captured, before Opus encoding.  The server forwards these bytes unchanged,
+ * allowing capture -> server -> receiver loss to be distinguished.
+ */
+size_t ptt_build_rtp_with_frame_metadata(uint8_t *packet,
+                                         size_t packet_capacity,
+                                         uint8_t payload_type,
+                                         uint8_t marker,
+                                         uint16_t sequence,
+                                         uint32_t timestamp,
+                                         uint32_t ssrc,
+                                         uint64_t send_time_ms,
+                                         uint32_t source_frame_id,
+                                         uint64_t capture_time_ms,
+                                         const uint8_t *payload,
+                                         size_t payload_length);
 
 int ptt_parse_rtp(const uint8_t *packet,
                   size_t packet_length,

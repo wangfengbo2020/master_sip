@@ -53,6 +53,10 @@ struct ptt_client {
     int64_t rx_interval_latency_max_ms;
     int rx_sequence_valid;
     uint16_t rx_last_sequence;
+    int rx_source_frame_valid;
+    uint32_t rx_last_source_frame_id;
+    int rx_capture_time_valid;
+    uint64_t rx_last_capture_time_ms;
     uint32_t rx_last_timestamp;
     uint64_t rx_last_arrival_ms;
     uint64_t rx_interval_lost_packets;
@@ -63,6 +67,11 @@ struct ptt_client {
     uint64_t rx_interval_interarrival_deviation_sum_ms;
     uint64_t rx_interval_max_interarrival_ms;
     uint64_t rx_interval_late_gaps;
+    uint64_t rx_interval_drain_wakeups;
+    uint64_t rx_interval_max_drain_packets;
+    uint64_t rx_interval_kernel_drops;
+    uint32_t rx_last_kernel_drop_count;
+    int rx_kernel_drop_count_valid;
     size_t rx_interval_payload_min_bytes;
     size_t rx_interval_payload_max_bytes;
     uint64_t last_rx_packets_per_second;
@@ -111,6 +120,7 @@ void ptt_client_config_init(ptt_client_config *config)
     config->server_rtp_port = 40000;
     config->opus_bitrate = 16000;
     config->simulate_opus = 0;
+    config->self_loopback = 0;
 }
 
 const char *ptt_client_mode_name(ptt_client_mode mode)
@@ -184,6 +194,7 @@ static int bind_udp(uint16_t requested_port, uint16_t *actual_port)
 {
     int fd;
     int reuse = 1;
+    int socket_buffer = 1024 * 1024;
     struct sockaddr_in address;
     socklen_t address_length = sizeof(address);
 
@@ -192,6 +203,19 @@ static int bind_udp(uint16_t requested_port, uint16_t *actual_port)
         return -1;
     }
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    (void)setsockopt(fd,
+                     SOL_SOCKET,
+                     SO_RCVBUF,
+                     &socket_buffer,
+                     sizeof(socket_buffer));
+    (void)setsockopt(fd,
+                     SOL_SOCKET,
+                     SO_SNDBUF,
+                     &socket_buffer,
+                     sizeof(socket_buffer));
+#ifdef SO_RXQ_OVFL
+    (void)setsockopt(fd, SOL_SOCKET, SO_RXQ_OVFL, &reuse, sizeof(reuse));
+#endif
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -252,11 +276,13 @@ static unsigned int send_request(ptt_client *client,
     sequence = client->cseq;
     snprintf(extra,
              sizeof(extra),
-             "X-Device-ID: %s\r\nX-Group-ID: %s\r\nX-RTP-Port: %u\r\nX-SSRC: %u\r\n",
+             "X-Device-ID: %s\r\nX-Group-ID: %s\r\nX-RTP-Port: %u\r\n"
+             "X-SSRC: %u\r\nX-RTP-Loopback: %d\r\n",
              client->config.device_id,
              client->config.group_id,
              client->config.local_rtp_port,
-             client->ssrc);
+             client->ssrc,
+             client->config.self_loopback ? 1 : 0);
     length = snprintf(message,
                       sizeof(message),
                       "%s sip:%s@%s SIP/2.0\r\n"
@@ -697,39 +723,105 @@ static size_t opus_payload_bytes(const ptt_client *client)
 
 static int send_rtp_payload(ptt_client *client,
                             const uint8_t *payload,
-                            size_t payload_length)
+                            size_t payload_length,
+                            uint32_t source_frame_id,
+                            uint64_t capture_time_ms,
+                            uint16_t *sent_sequence)
 {
     uint8_t packet[PTT_MAX_RTP_PACKET];
     size_t packet_length;
+    uint16_t sequence;
+    uint32_t timestamp;
+    uint64_t send_time_ms;
+    int marker;
+    int send_error = 0;
+    ssize_t sent_bytes;
 
     if (!client->floor_granted || payload == NULL || payload_length == 0) {
         return -1;
     }
-    packet_length = ptt_build_rtp(packet,
-                                  sizeof(packet),
-                                  PTT_OPUS_PAYLOAD_TYPE,
-                                  client->tx_packets_in_talk == 0,
-                                  client->rtp_sequence,
-                                  client->rtp_timestamp,
-                                  client->ssrc,
-                                  ptt_unix_time_ms(),
-                                  payload,
-                                  payload_length);
+    sequence = client->rtp_sequence;
+    timestamp = client->rtp_timestamp;
+    send_time_ms = ptt_unix_time_ms();
+    marker = client->tx_packets_in_talk == 0;
+    packet_length = ptt_build_rtp_with_frame_metadata(
+        packet,
+        sizeof(packet),
+        PTT_OPUS_PAYLOAD_TYPE,
+        marker,
+        sequence,
+        timestamp,
+        client->ssrc,
+        send_time_ms,
+        source_frame_id,
+        capture_time_ms,
+        payload,
+        payload_length);
     ++client->rtp_sequence;
     client->rtp_timestamp += PTT_OPUS_TIMESTAMP_STEP;
     if (packet_length == 0) {
         return -1;
     }
-    if (sendto(client->rtp_fd,
-               packet,
-               packet_length,
-               0,
-               (const struct sockaddr *)&client->server_rtp_address,
-               sizeof(client->server_rtp_address)) < 0) {
+    sent_bytes = sendto(client->rtp_fd,
+                        packet,
+                        packet_length,
+                        0,
+                        (const struct sockaddr *)&client->server_rtp_address,
+                        sizeof(client->server_rtp_address));
+    if (sent_bytes < 0) {
+        send_error = errno;
+        emit_log(client,
+                 "[%s] [frame-tx-drop] capture_frame=%u seq=%u rtp_ts=%u "
+                 "capture_ms=%llu send_ms=%llu capture_to_send_ms=%lld "
+                 "payload=%zu marker=%d errno=%d error=%s",
+                 client->config.device_id,
+                 source_frame_id,
+                 sequence,
+                 timestamp,
+                 (unsigned long long)capture_time_ms,
+                 (unsigned long long)send_time_ms,
+                 (long long)((int64_t)send_time_ms - (int64_t)capture_time_ms),
+                 payload_length,
+                 marker,
+                 send_error,
+                 strerror(send_error));
+    }
+    if (sent_bytes >= 0 && sent_sequence != NULL) {
+        *sent_sequence = sequence;
+    }
+    if (client->config.send_packet_fn != NULL) {
+        ptt_client_send_packet_info packet_info;
+
+        packet_info.sequence = sequence;
+        packet_info.rtp_timestamp = timestamp;
+        packet_info.send_time_ms = send_time_ms;
+        packet_info.source_frame_id = source_frame_id;
+        packet_info.capture_time_ms = capture_time_ms;
+        packet_info.payload_length = payload_length;
+        packet_info.marker = marker;
+        packet_info.succeeded = sent_bytes >= 0;
+        packet_info.error_code = send_error;
+        client->config.send_packet_fn(client->config.send_packet_user_data,
+                                      &packet_info);
+    }
+    if (sent_bytes < 0) {
         return -1;
     }
     ++client->transmitted_packets;
     ++client->tx_packets_in_talk;
+    emit_log(client,
+             "[%s] [frame-tx] capture_frame=%u seq=%u rtp_ts=%u "
+             "capture_ms=%llu send_ms=%llu capture_to_send_ms=%lld "
+             "payload=%zu marker=%d continuous=1",
+             client->config.device_id,
+             source_frame_id,
+             sequence,
+             timestamp,
+             (unsigned long long)capture_time_ms,
+             (unsigned long long)send_time_ms,
+             (long long)((int64_t)send_time_ms - (int64_t)capture_time_ms),
+             payload_length,
+             marker);
     return 0;
 }
 
@@ -737,10 +829,41 @@ int ptt_client_send_opus(ptt_client *client,
                          const uint8_t *opus_packet,
                          size_t opus_packet_length)
 {
+    return ptt_client_send_opus_ex(client, opus_packet, opus_packet_length, NULL);
+}
+
+int ptt_client_send_opus_ex(ptt_client *client,
+                            const uint8_t *opus_packet,
+                            size_t opus_packet_length,
+                            uint16_t *sent_sequence)
+{
     if (client == NULL || client->config.simulate_opus) {
         return -1;
     }
-    return send_rtp_payload(client, opus_packet, opus_packet_length);
+    return ptt_client_send_opus_frame(client,
+                                      opus_packet,
+                                      opus_packet_length,
+                                      (uint32_t)client->tx_packets_in_talk,
+                                      ptt_unix_time_ms(),
+                                      sent_sequence);
+}
+
+int ptt_client_send_opus_frame(ptt_client *client,
+                               const uint8_t *opus_packet,
+                               size_t opus_packet_length,
+                               uint32_t source_frame_id,
+                               uint64_t capture_time_ms,
+                               uint16_t *sent_sequence)
+{
+    if (client == NULL || client->config.simulate_opus) {
+        return -1;
+    }
+    return send_rtp_payload(client,
+                            opus_packet,
+                            opus_packet_length,
+                            source_frame_id,
+                            capture_time_ms,
+                            sent_sequence);
 }
 
 static void send_simulated_opus(ptt_client *client)
@@ -755,7 +878,12 @@ static void send_simulated_opus(ptt_client *client)
     for (i = 0; i < payload_length; ++i) {
         payload[i] = (uint8_t)(client->rtp_sequence + i * 29u + (client->ssrc & 0xffu));
     }
-    (void)send_rtp_payload(client, payload, payload_length);
+    (void)send_rtp_payload(client,
+                           payload,
+                           payload_length,
+                           (uint32_t)client->tx_packets_in_talk,
+                           ptt_unix_time_ms(),
+                           NULL);
 }
 
 static void send_rtp_keepalive(ptt_client *client)
@@ -814,6 +942,7 @@ static void finish_receive_interval(ptt_client *client)
                  "payload_bytes avg=%.1f min=%zu max=%zu "
                  "seq_lost=%llu duplicate=%llu out_of_order=%llu max_seq_gap=%llu "
                  "arrival_ms max=%llu avg_deviation=%.1f late_gaps=%llu "
+                 "drain_max=%llu kernel_drops=%llu "
                  "delay_ms avg=%.1f min=%lld max=%lld missing_timestamp=%llu",
                  client->config.device_id,
                  (unsigned long long)client->rx_interval_packets,
@@ -828,6 +957,8 @@ static void finish_receive_interval(ptt_client *client)
                  (unsigned long long)client->rx_interval_max_interarrival_ms,
                  average_interarrival_deviation_ms,
                  (unsigned long long)client->rx_interval_late_gaps,
+                 (unsigned long long)client->rx_interval_max_drain_packets,
+                 (unsigned long long)client->rx_interval_kernel_drops,
                  client->last_latency_average_ms,
                  (long long)client->rx_interval_latency_min_ms,
                  (long long)client->rx_interval_latency_max_ms,
@@ -838,6 +969,7 @@ static void finish_receive_interval(ptt_client *client)
                  "payload_bytes avg=%.1f min=%zu max=%zu "
                  "seq_lost=%llu duplicate=%llu out_of_order=%llu max_seq_gap=%llu "
                  "arrival_ms max=%llu avg_deviation=%.1f late_gaps=%llu "
+                 "drain_max=%llu kernel_drops=%llu "
                  "delay_ms unavailable missing_timestamp=%llu",
                  client->config.device_id,
                  (unsigned long long)client->rx_interval_packets,
@@ -852,6 +984,8 @@ static void finish_receive_interval(ptt_client *client)
                  (unsigned long long)client->rx_interval_max_interarrival_ms,
                  average_interarrival_deviation_ms,
                  (unsigned long long)client->rx_interval_late_gaps,
+                 (unsigned long long)client->rx_interval_max_drain_packets,
+                 (unsigned long long)client->rx_interval_kernel_drops,
                  (unsigned long long)client->rx_interval_missing_timestamps);
     }
 }
@@ -874,6 +1008,9 @@ static void reset_receive_interval(ptt_client *client, uint64_t now_ms)
     client->rx_interval_interarrival_deviation_sum_ms = 0;
     client->rx_interval_max_interarrival_ms = 0;
     client->rx_interval_late_gaps = 0;
+    client->rx_interval_drain_wakeups = 0;
+    client->rx_interval_max_drain_packets = 0;
+    client->rx_interval_kernel_drops = 0;
     client->rx_interval_payload_min_bytes = 0;
     client->rx_interval_payload_max_bytes = 0;
 }
@@ -933,32 +1070,85 @@ static void record_receive_sequence(ptt_client *client,
     client->rx_last_arrival_ms = now_ms;
 }
 
-static void receive_rtp(ptt_client *client)
+static int receive_rtp(ptt_client *client)
 {
     uint8_t packet[PTT_MAX_RTP_PACKET];
     struct sockaddr_in source;
-    socklen_t source_length = sizeof(source);
+    struct iovec io_vector;
+    struct msghdr message;
+#ifdef SO_RXQ_OVFL
+    char control[CMSG_SPACE(sizeof(uint32_t))];
+    struct cmsghdr *control_message;
+#endif
     ssize_t received;
     ptt_rtp_view view;
     uint64_t now_ms;
+    uint64_t arrival_unix_ms;
+    uint16_t previous_sequence;
+    uint16_t sequence_delta;
+    int previous_valid;
+    uint32_t previous_source_frame_id;
+    uint32_t source_frame_delta;
+    int source_previous_valid;
+    int source_continuous;
+    uint64_t arrival_gap_ms;
+    uint64_t capture_gap_ms;
+    int rtp_continuous;
+    int continuous;
+    const char *sequence_status;
 
-    received = recvfrom(client->rtp_fd,
-                        packet,
-                        sizeof(packet),
-                        0,
-                        (struct sockaddr *)&source,
-                        &source_length);
+    memset(&message, 0, sizeof(message));
+    io_vector.iov_base = packet;
+    io_vector.iov_len = sizeof(packet);
+    message.msg_name = &source;
+    message.msg_namelen = sizeof(source);
+    message.msg_iov = &io_vector;
+    message.msg_iovlen = 1;
+#ifdef SO_RXQ_OVFL
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+#endif
+    received = recvmsg(client->rtp_fd, &message, MSG_DONTWAIT);
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return 0;
+        }
+        return -1;
+    }
+#ifdef SO_RXQ_OVFL
+    for (control_message = CMSG_FIRSTHDR(&message);
+         control_message != NULL;
+         control_message = CMSG_NXTHDR(&message, control_message)) {
+        if (control_message->cmsg_level == SOL_SOCKET &&
+            control_message->cmsg_type == SO_RXQ_OVFL &&
+            control_message->cmsg_len >= CMSG_LEN(sizeof(uint32_t))) {
+            uint32_t cumulative_drops;
+            memcpy(&cumulative_drops,
+                   CMSG_DATA(control_message),
+                   sizeof(cumulative_drops));
+            if (client->rx_kernel_drop_count_valid) {
+                client->rx_interval_kernel_drops +=
+                    (uint32_t)(cumulative_drops - client->rx_last_kernel_drop_count);
+            } else {
+                client->rx_interval_kernel_drops += cumulative_drops;
+            }
+            client->rx_last_kernel_drop_count = cumulative_drops;
+            client->rx_kernel_drop_count_valid = 1;
+        }
+    }
+#endif
     if (received <= 0 || !ptt_parse_rtp(packet, (size_t)received, &view)) {
-        return;
+        return 1;
     }
     if (!same_endpoint(&source, &client->server_rtp_address)) {
         ++client->rejected_peer_packets;
-        return;
+        return 1;
     }
     if (view.payload_type != PTT_OPUS_PAYLOAD_TYPE) {
-        return;
+        return 1;
     }
     now_ms = ptt_now_ms();
+    arrival_unix_ms = ptt_unix_time_ms();
     if (client->rx_interval_started_ms == 0) {
         reset_receive_interval(client, now_ms);
     } else if (now_ms - client->rx_interval_started_ms >= 1000u) {
@@ -975,9 +1165,128 @@ static void receive_rtp(ptt_client *client)
     if (view.payload_length > client->rx_interval_payload_max_bytes) {
         client->rx_interval_payload_max_bytes = view.payload_length;
     }
+    previous_valid = client->rx_sequence_valid && !view.marker;
+    previous_sequence = client->rx_last_sequence;
+    arrival_gap_ms = previous_valid && now_ms >= client->rx_last_arrival_ms
+                         ? now_ms - client->rx_last_arrival_ms
+                         : 0u;
+    sequence_delta = previous_valid
+                         ? (uint16_t)(view.sequence - previous_sequence)
+                         : 0u;
+    if (!previous_valid) {
+        rtp_continuous = 1;
+        sequence_status = view.marker ? "start" : "first";
+    } else if (sequence_delta == 1u) {
+        rtp_continuous = 1;
+        sequence_status = "continuous";
+    } else if (sequence_delta == 0u) {
+        rtp_continuous = 0;
+        sequence_status = "duplicate";
+    } else if (sequence_delta >= 0x8000u) {
+        rtp_continuous = 0;
+        sequence_status = "out_of_order";
+    } else {
+        rtp_continuous = 0;
+        sequence_status = "gap";
+    }
+    previous_source_frame_id = client->rx_last_source_frame_id;
+    source_previous_valid = view.has_source_frame_id &&
+                            client->rx_source_frame_valid && !view.marker;
+    source_frame_delta = source_previous_valid
+                             ? view.source_frame_id - previous_source_frame_id
+                             : 0u;
+    source_continuous = !source_previous_valid || source_frame_delta == 1u;
+    capture_gap_ms = view.has_capture_time_ms &&
+                             client->rx_capture_time_valid && !view.marker &&
+                             view.capture_time_ms >= client->rx_last_capture_time_ms
+                         ? view.capture_time_ms - client->rx_last_capture_time_ms
+                         : 0u;
+    continuous = rtp_continuous && source_continuous;
+    emit_log(client,
+             "[%s] [frame-rx] capture_frame=%u has_capture_frame=%d seq=%u "
+             "arrival_ms=%llu capture_ms=%llu send_ms=%llu age_ms=%lld "
+             "capture_to_send_ms=%lld arrival_gap_ms=%llu capture_gap_ms=%llu "
+             "previous=%u previous_valid=%d delta=%u source_previous=%u "
+             "source_previous_valid=%d source_delta=%u rtp_continuous=%d "
+             "source_continuous=%d continuous=%d marker=%u status=%s payload=%zu",
+             client->config.device_id,
+             view.source_frame_id,
+             view.has_source_frame_id,
+             view.sequence,
+             (unsigned long long)arrival_unix_ms,
+             (unsigned long long)(view.has_capture_time_ms
+                                      ? view.capture_time_ms
+                                      : 0u),
+             (unsigned long long)(view.has_send_time_ms ? view.send_time_ms : 0u),
+             (long long)(view.has_send_time_ms
+                             ? (int64_t)arrival_unix_ms -
+                                   (int64_t)view.send_time_ms
+                             : -1),
+             (long long)(view.has_send_time_ms && view.has_capture_time_ms
+                             ? (int64_t)view.send_time_ms -
+                                   (int64_t)view.capture_time_ms
+                             : -1),
+             (unsigned long long)arrival_gap_ms,
+             (unsigned long long)capture_gap_ms,
+             previous_sequence,
+             previous_valid,
+             sequence_delta,
+             previous_source_frame_id,
+             source_previous_valid,
+             source_frame_delta,
+             rtp_continuous,
+             source_continuous,
+             continuous,
+             view.marker,
+             sequence_status,
+             view.payload_length);
+    if (client->config.receive_packet_fn != NULL) {
+        ptt_client_receive_packet_info packet_info;
+
+        memset(&packet_info, 0, sizeof(packet_info));
+        packet_info.sequence = view.sequence;
+        packet_info.previous_sequence = previous_sequence;
+        packet_info.sequence_delta = sequence_delta;
+        packet_info.arrival_time_ms = arrival_unix_ms;
+        packet_info.payload_length = view.payload_length;
+        packet_info.previous_valid = previous_valid;
+        packet_info.continuous = continuous;
+        packet_info.marker = view.marker != 0;
+        packet_info.has_source_frame_id = view.has_source_frame_id;
+        packet_info.source_frame_id = view.source_frame_id;
+        packet_info.previous_source_frame_id = previous_source_frame_id;
+        packet_info.source_frame_delta = source_frame_delta;
+        packet_info.source_previous_valid = source_previous_valid;
+        packet_info.source_continuous = source_continuous;
+        packet_info.has_capture_time_ms = view.has_capture_time_ms;
+        packet_info.capture_time_ms = view.capture_time_ms;
+        packet_info.has_send_time_ms = view.has_send_time_ms;
+        packet_info.send_time_ms = view.send_time_ms;
+        packet_info.transport_delay_ms = view.has_send_time_ms
+                                             ? (int64_t)arrival_unix_ms -
+                                                   (int64_t)view.send_time_ms
+                                             : -1;
+        packet_info.arrival_gap_ms = arrival_gap_ms;
+        packet_info.capture_gap_ms = capture_gap_ms;
+        packet_info.status = sequence_status;
+        client->config.receive_packet_fn(
+            client->config.receive_packet_user_data,
+            &packet_info);
+    }
+    if (view.has_source_frame_id &&
+        (!source_previous_valid ||
+         (source_frame_delta > 0u && source_frame_delta < 0x80000000u))) {
+        client->rx_source_frame_valid = 1;
+        client->rx_last_source_frame_id = view.source_frame_id;
+    }
+    if (view.has_capture_time_ms) {
+        client->rx_capture_time_valid = 1;
+        client->rx_last_capture_time_ms = view.capture_time_ms;
+    }
     record_receive_sequence(client, &view, now_ms);
     if (view.has_send_time_ms) {
-        int64_t latency_ms = (int64_t)ptt_unix_time_ms() - (int64_t)view.send_time_ms;
+        int64_t latency_ms =
+            (int64_t)arrival_unix_ms - (int64_t)view.send_time_ms;
         if (client->rx_interval_latency_samples == 0) {
             client->rx_interval_latency_min_ms = latency_ms;
             client->rx_interval_latency_max_ms = latency_ms;
@@ -998,8 +1307,10 @@ static void receive_rtp(ptt_client *client)
         client->config.opus_receive_fn(client->config.opus_receive_user_data,
                                        view.payload,
                                        view.payload_length,
-                                       view.sequence);
+                                       view.sequence,
+                                       view.marker != 0);
     }
+    return 1;
 }
 
 static void run_timers(ptt_client *client)
@@ -1071,7 +1382,21 @@ int ptt_client_poll(ptt_client *client, unsigned int timeout_ms)
         }
     }
     if (FD_ISSET(client->rtp_fd, &read_set)) {
-        receive_rtp(client);
+        uint64_t drained_packets = 0;
+        int receive_result;
+
+        do {
+            receive_result = receive_rtp(client);
+            if (receive_result > 0) {
+                ++drained_packets;
+            }
+        } while (receive_result > 0);
+        if (drained_packets > 0) {
+            ++client->rx_interval_drain_wakeups;
+            if (drained_packets > client->rx_interval_max_drain_packets) {
+                client->rx_interval_max_drain_packets = drained_packets;
+            }
+        }
     }
     run_timers(client);
     return 0;

@@ -199,6 +199,57 @@ size_t ptt_build_rtp(uint8_t *packet,
     return PTT_RTP_HEADER_WITH_SEND_TIME + payload_length;
 }
 
+size_t ptt_build_rtp_with_frame_metadata(uint8_t *packet,
+                                         size_t packet_capacity,
+                                         uint8_t payload_type,
+                                         uint8_t marker,
+                                         uint16_t sequence,
+                                         uint32_t timestamp,
+                                         uint32_t ssrc,
+                                         uint64_t send_time_ms,
+                                         uint32_t source_frame_id,
+                                         uint64_t capture_time_ms,
+                                         const uint8_t *payload,
+                                         size_t payload_length)
+{
+    size_t i;
+
+    if (packet == NULL || payload == NULL ||
+        packet_capacity < PTT_RTP_HEADER_WITH_FRAME_METADATA + payload_length) {
+        return 0;
+    }
+
+    packet[0] = 0x90; /* RTP V=2, X=1. */
+    packet[1] = (uint8_t)((marker ? 0x80 : 0x00) | (payload_type & 0x7f));
+    packet[2] = (uint8_t)(sequence >> 8);
+    packet[3] = (uint8_t)sequence;
+    packet[4] = (uint8_t)(timestamp >> 24);
+    packet[5] = (uint8_t)(timestamp >> 16);
+    packet[6] = (uint8_t)(timestamp >> 8);
+    packet[7] = (uint8_t)timestamp;
+    packet[8] = (uint8_t)(ssrc >> 24);
+    packet[9] = (uint8_t)(ssrc >> 16);
+    packet[10] = (uint8_t)(ssrc >> 8);
+    packet[11] = (uint8_t)ssrc;
+    packet[12] = (uint8_t)(PTT_RTP_SEND_TIME_PROFILE >> 8);
+    packet[13] = (uint8_t)PTT_RTP_SEND_TIME_PROFILE;
+    packet[14] = 0;
+    packet[15] = 5; /* 20 bytes: send time, source frame id, capture time. */
+    for (i = 0; i < 8; ++i) {
+        packet[16 + i] = (uint8_t)(send_time_ms >> (56u - (unsigned int)i * 8u));
+    }
+    packet[24] = (uint8_t)(source_frame_id >> 24);
+    packet[25] = (uint8_t)(source_frame_id >> 16);
+    packet[26] = (uint8_t)(source_frame_id >> 8);
+    packet[27] = (uint8_t)source_frame_id;
+    for (i = 0; i < 8; ++i) {
+        packet[28 + i] =
+            (uint8_t)(capture_time_ms >> (56u - (unsigned int)i * 8u));
+    }
+    memcpy(packet + PTT_RTP_HEADER_WITH_FRAME_METADATA, payload, payload_length);
+    return PTT_RTP_HEADER_WITH_FRAME_METADATA + payload_length;
+}
+
 int ptt_parse_rtp(const uint8_t *packet,
                   size_t packet_length,
                   ptt_rtp_view *view)
@@ -216,6 +267,10 @@ int ptt_parse_rtp(const uint8_t *packet,
     has_extension = packet[0] & 0x10;
     view->has_send_time_ms = 0;
     view->send_time_ms = 0;
+    view->has_source_frame_id = 0;
+    view->source_frame_id = 0;
+    view->has_capture_time_ms = 0;
+    view->capture_time_ms = 0;
     header_length = 12u + (size_t)csrc_count * 4u;
     if (packet_length < header_length) {
         return 0;
@@ -246,6 +301,23 @@ int ptt_parse_rtp(const uint8_t *packet,
             }
             view->has_send_time_ms = 1;
             view->send_time_ms = send_time_ms;
+            if (extension_bytes >= 20u) {
+                uint64_t capture_time_ms = 0;
+
+                view->source_frame_id =
+                    ((uint32_t)packet[header_length + 12u] << 24) |
+                    ((uint32_t)packet[header_length + 13u] << 16) |
+                    ((uint32_t)packet[header_length + 14u] << 8) |
+                    (uint32_t)packet[header_length + 15u];
+                for (i = 0; i < 8; ++i) {
+                    capture_time_ms =
+                        (capture_time_ms << 8) |
+                        packet[header_length + 16u + i];
+                }
+                view->has_source_frame_id = 1;
+                view->has_capture_time_ms = 1;
+                view->capture_time_ms = capture_time_ms;
+            }
         }
         header_length += 4u + extension_bytes;
     }

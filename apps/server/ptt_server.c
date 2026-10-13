@@ -14,6 +14,7 @@
 
 #define SERVER_MAX_CLIENTS 64
 #define SERVER_MAX_FLOORS 16
+#define SERVER_PACKET_HISTORY_CAPACITY (PTT_OPUS_PACKETS_PER_SECOND * 180u)
 
 typedef struct {
     int used;
@@ -24,8 +25,15 @@ typedef struct {
     struct sockaddr_in sip_address;
     struct sockaddr_in rtp_address;
     uint32_t ssrc;
+    int self_loopback;
     uint64_t expires_at_ms;
     uint64_t forwarded_packets;
+    int rx_sequence_valid;
+    uint16_t rx_last_sequence;
+    int rx_source_frame_valid;
+    uint32_t rx_last_source_frame_id;
+    int rx_capture_time_valid;
+    uint64_t rx_last_capture_time_ms;
 } server_client;
 
 typedef struct {
@@ -44,16 +52,122 @@ typedef struct {
     unsigned int run_seconds;
 } server_config;
 
+typedef struct {
+    uint64_t receive_ms;
+    uint64_t phone_send_ms;
+    uint32_t source_frame_id;
+    uint16_t sequence;
+    uint16_t payload_length;
+    uint16_t recipients;
+    uint16_t send_errors;
+    uint8_t continuous;
+    uint8_t marker;
+    char device_id[PTT_MAX_ID];
+    char group[PTT_MAX_GROUP];
+    char status[16];
+} server_packet_history_entry;
+
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_dump_packet_history = 0;
 static server_client g_clients[SERVER_MAX_CLIENTS];
 static group_floor g_floors[SERVER_MAX_FLOORS];
 static int g_sip_fd = -1;
 static unsigned int g_server_cseq = 1;
+static uint64_t g_rtp_stats_started_ms;
+static uint64_t g_rtp_stats_received_packets;
+static uint64_t g_rtp_stats_forwarded_copies;
+static uint64_t g_rtp_stats_send_errors;
+static uint64_t g_rtp_stats_max_drain_packets;
+static server_packet_history_entry
+    g_packet_history[SERVER_PACKET_HISTORY_CAPACITY];
+static size_t g_packet_history_write;
+static size_t g_packet_history_count;
 
 static void on_signal(int signal_number)
 {
-    (void)signal_number;
-    g_running = 0;
+    if (signal_number == SIGUSR1) {
+        g_dump_packet_history = 1;
+    } else {
+        g_running = 0;
+    }
+}
+
+static void append_packet_history(const server_client *client,
+                                  const ptt_rtp_view *view,
+                                  uint64_t receive_ms,
+                                  unsigned int recipients,
+                                  unsigned int send_errors,
+                                  int continuous,
+                                  const char *status)
+{
+    server_packet_history_entry *entry =
+        &g_packet_history[g_packet_history_write];
+
+    memset(entry, 0, sizeof(*entry));
+    entry->receive_ms = receive_ms;
+    entry->phone_send_ms = view->has_send_time_ms ? view->send_time_ms : 0u;
+    entry->source_frame_id = view->source_frame_id;
+    entry->sequence = view->sequence;
+    entry->payload_length =
+        view->payload_length <= UINT16_MAX
+            ? (uint16_t)view->payload_length
+            : UINT16_MAX;
+    entry->recipients = recipients <= UINT16_MAX
+                            ? (uint16_t)recipients
+                            : UINT16_MAX;
+    entry->send_errors = send_errors <= UINT16_MAX
+                             ? (uint16_t)send_errors
+                             : UINT16_MAX;
+    entry->continuous = continuous ? 1u : 0u;
+    entry->marker = view->marker ? 1u : 0u;
+    snprintf(entry->device_id, sizeof(entry->device_id), "%s", client->id);
+    snprintf(entry->group, sizeof(entry->group), "%s", client->group);
+    snprintf(entry->status,
+             sizeof(entry->status),
+             "%s",
+             status != NULL ? status : "unknown");
+    g_packet_history_write =
+        (g_packet_history_write + 1u) % SERVER_PACKET_HISTORY_CAPACITY;
+    if (g_packet_history_count < SERVER_PACKET_HISTORY_CAPACITY) {
+        ++g_packet_history_count;
+    }
+}
+
+static void dump_packet_history(void)
+{
+    size_t i;
+    size_t first =
+        (g_packet_history_write + SERVER_PACKET_HISTORY_CAPACITY -
+         g_packet_history_count) %
+        SERVER_PACKET_HISTORY_CAPACITY;
+
+    printf("[history-dump] version=%s packets=%zu capacity=%u "
+           "window_seconds=180\n",
+           PTT_PRODUCT_VERSION,
+           g_packet_history_count,
+           (unsigned int)SERVER_PACKET_HISTORY_CAPACITY);
+    for (i = 0; i < g_packet_history_count; ++i) {
+        const server_packet_history_entry *entry =
+            &g_packet_history[(first + i) % SERVER_PACKET_HISTORY_CAPACITY];
+        printf("[history-frame] receive_ms=%llu phone_send_ms=%llu "
+               "group=%s from=%s capture_frame=%u seq=%u payload=%u "
+               "recipients=%u send_errors=%u continuous=%u marker=%u "
+               "status=%s\n",
+               (unsigned long long)entry->receive_ms,
+               (unsigned long long)entry->phone_send_ms,
+               entry->group,
+               entry->device_id,
+               entry->source_frame_id,
+               entry->sequence,
+               entry->payload_length,
+               entry->recipients,
+               entry->send_errors,
+               entry->continuous,
+               entry->marker,
+               entry->status);
+    }
+    printf("[history-dump-end] packets=%zu\n", g_packet_history_count);
+    fflush(stdout);
 }
 
 static void print_usage(const char *program)
@@ -115,6 +229,7 @@ static int make_udp_socket(const char *bind_ip, uint16_t port)
 {
     int fd;
     int reuse = 1;
+    int socket_buffer = 4 * 1024 * 1024;
     struct sockaddr_in address;
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -122,6 +237,8 @@ static int make_udp_socket(const char *bind_ip, uint16_t port)
         return -1;
     }
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &socket_buffer, sizeof(socket_buffer));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &socket_buffer, sizeof(socket_buffer));
 
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
@@ -401,6 +518,7 @@ static void handle_register(int sip_fd,
     long rtp_port;
     unsigned long ssrc;
     unsigned long expires = 3600;
+    int self_loopback = 0;
     char ip[INET_ADDRSTRLEN];
 
     if (!request_identity(message, id, sizeof(id), group, sizeof(group)) ||
@@ -421,6 +539,9 @@ static void handle_register(int sip_fd,
     ssrc = ptt_get_header(message, "X-SSRC", value, sizeof(value))
                ? strtoul(value, NULL, 10)
                : ptt_hash_text(id);
+    if (ptt_get_header(message, "X-RTP-Loopback", value, sizeof(value))) {
+        self_loopback = strtol(value, NULL, 10) != 0;
+    }
 
     index = find_or_create_client(id);
     if (index < 0) {
@@ -440,16 +561,18 @@ static void handle_register(int sip_fd,
     g_clients[index].rtp_address = *source;
     g_clients[index].rtp_address.sin_port = htons((uint16_t)rtp_port);
     g_clients[index].ssrc = (uint32_t)ssrc;
+    g_clients[index].self_loopback = self_loopback;
     g_clients[index].expires_at_ms = ptt_now_ms() + expires * 1000u;
     strncpy(g_clients[index].group, group, sizeof(g_clients[index].group) - 1);
 
-    printf("[sip] REGISTER id=%s group=%s sip=%s:%u rtp=%u ssrc=%u\n",
+    printf("[sip] REGISTER id=%s group=%s sip=%s:%u rtp=%u ssrc=%u loopback=%d\n",
            id,
            group,
            address_text(source, ip, sizeof(ip)),
            ntohs(source->sin_port),
            (unsigned int)rtp_port,
-           g_clients[index].ssrc);
+           g_clients[index].ssrc,
+           g_clients[index].self_loopback);
     send_sip_response(sip_fd, source, message, 200, "OK", "Expires: 3600\r\n", NULL, NULL);
 }
 
@@ -661,6 +784,20 @@ static void handle_rtp_packet(int rtp_fd,
     int floor_index;
     int i;
     unsigned int recipients = 0;
+    unsigned int packet_send_errors = 0;
+    uint64_t receive_ms;
+    uint64_t receive_monotonic_ms;
+    uint16_t previous_sequence;
+    uint16_t sequence_delta;
+    int previous_valid;
+    int rtp_continuous;
+    uint32_t previous_source_frame_id;
+    uint32_t source_frame_delta;
+    int source_previous_valid;
+    int source_continuous;
+    uint64_t capture_gap_ms;
+    int continuous;
+    const char *sequence_status;
 
     if (!ptt_parse_rtp(packet, packet_length, &view)) {
         return;
@@ -687,22 +824,154 @@ static void handle_rtp_packet(int rtp_fd,
         return;
     }
 
-    g_floors[floor_index].last_rtp_ms = ptt_now_ms();
+    receive_ms = ptt_unix_time_ms();
+    receive_monotonic_ms = ptt_now_ms();
+    g_floors[floor_index].last_rtp_ms = receive_monotonic_ms;
+
+    previous_valid = g_clients[sender_index].rx_sequence_valid && !view.marker;
+    previous_sequence = g_clients[sender_index].rx_last_sequence;
+    sequence_delta = previous_valid
+                         ? (uint16_t)(view.sequence - previous_sequence)
+                         : 0u;
+    if (!previous_valid) {
+        rtp_continuous = 1;
+        sequence_status = view.marker ? "start" : "first";
+    } else if (sequence_delta == 1u) {
+        rtp_continuous = 1;
+        sequence_status = "continuous";
+    } else if (sequence_delta == 0u) {
+        rtp_continuous = 0;
+        sequence_status = "duplicate";
+    } else if (sequence_delta >= 0x8000u) {
+        rtp_continuous = 0;
+        sequence_status = "out_of_order";
+    } else {
+        rtp_continuous = 0;
+        sequence_status = "gap";
+    }
+    previous_source_frame_id =
+        g_clients[sender_index].rx_last_source_frame_id;
+    source_previous_valid = view.has_source_frame_id &&
+                            g_clients[sender_index].rx_source_frame_valid &&
+                            !view.marker;
+    source_frame_delta = source_previous_valid
+                             ? view.source_frame_id - previous_source_frame_id
+                             : 0u;
+    source_continuous = !source_previous_valid || source_frame_delta == 1u;
+    capture_gap_ms = view.has_capture_time_ms &&
+                             g_clients[sender_index].rx_capture_time_valid &&
+                             !view.marker &&
+                             view.capture_time_ms >=
+                                 g_clients[sender_index].rx_last_capture_time_ms
+                         ? view.capture_time_ms -
+                               g_clients[sender_index].rx_last_capture_time_ms
+                         : 0u;
+    continuous = rtp_continuous && source_continuous;
+    if (!previous_valid ||
+        (sequence_delta > 0u && sequence_delta < 0x8000u)) {
+        g_clients[sender_index].rx_sequence_valid = 1;
+        g_clients[sender_index].rx_last_sequence = view.sequence;
+    }
+    if (view.has_source_frame_id &&
+        (!source_previous_valid ||
+         (source_frame_delta > 0u && source_frame_delta < 0x80000000u))) {
+        g_clients[sender_index].rx_source_frame_valid = 1;
+        g_clients[sender_index].rx_last_source_frame_id = view.source_frame_id;
+    }
+    if (view.has_capture_time_ms) {
+        g_clients[sender_index].rx_capture_time_valid = 1;
+        g_clients[sender_index].rx_last_capture_time_ms = view.capture_time_ms;
+    }
     for (i = 0; i < SERVER_MAX_CLIENTS; ++i) {
-        if (i == sender_index || !g_clients[i].used || !g_clients[i].joined ||
+        int is_sender = i == sender_index;
+        ssize_t sent;
+        uint64_t transmit_ms;
+
+        if ((is_sender && !g_clients[sender_index].self_loopback) ||
+            !g_clients[i].used || !g_clients[i].joined ||
             strcmp(g_clients[i].group, g_clients[sender_index].group) != 0) {
             continue;
         }
 
-        if (sendto(rtp_fd,
-                   packet,
-                   packet_length,
-                   0,
-                   (const struct sockaddr *)&g_clients[i].rtp_address,
-                   sizeof(g_clients[i].rtp_address)) >= 0) {
+        sent = sendto(rtp_fd,
+                      packet,
+                      packet_length,
+                      0,
+                      (const struct sockaddr *)&g_clients[i].rtp_address,
+                      sizeof(g_clients[i].rtp_address));
+        transmit_ms = ptt_unix_time_ms();
+        if (sent >= 0) {
             ++recipients;
+            ++g_rtp_stats_forwarded_copies;
+        } else {
+            ++g_rtp_stats_send_errors;
+            ++packet_send_errors;
+        }
+        if (is_sender) {
+            printf("[loopback-server] id=%s group=%s capture_frame=%u seq=%u "
+                   "phone_send_ms=%llu server_rx_ms=%llu server_tx_ms=%llu "
+                   "server_process_ms=%lld phone_to_server_clock_delta_ms=%lld "
+                   "payload=%zu result=%s\n",
+                   g_clients[sender_index].id,
+                   g_clients[sender_index].group,
+                   view.source_frame_id,
+                   view.sequence,
+                   (unsigned long long)(view.has_send_time_ms
+                                            ? view.send_time_ms
+                                            : 0u),
+                   (unsigned long long)receive_ms,
+                   (unsigned long long)transmit_ms,
+                   (long long)((int64_t)transmit_ms - (int64_t)receive_ms),
+                   (long long)(view.has_send_time_ms
+                                   ? (int64_t)receive_ms -
+                                         (int64_t)view.send_time_ms
+                                   : -1),
+                   view.payload_length,
+                   sent >= 0 ? "sent" : "send_error");
         }
     }
+
+    append_packet_history(&g_clients[sender_index],
+                          &view,
+                          receive_ms,
+                          recipients,
+                          packet_send_errors,
+                          continuous,
+                          sequence_status);
+
+    printf("[frame-server-rx] group=%s from=%s capture_frame=%u "
+           "has_capture_frame=%d source_previous=%u source_previous_valid=%d "
+           "source_delta=%u source_continuous=%d capture_ms=%llu "
+           "capture_gap_ms=%llu seq=%u previous=%u previous_valid=%d delta=%u "
+           "rtp_continuous=%d continuous=%d marker=%u status=%s "
+           "receive_ms=%llu send_ms=%llu age_ms=%lld payload=%zu recipients=%u\n",
+           g_clients[sender_index].group,
+           g_clients[sender_index].id,
+           view.source_frame_id,
+           view.has_source_frame_id,
+           previous_source_frame_id,
+           source_previous_valid,
+           source_frame_delta,
+           source_continuous,
+           (unsigned long long)(view.has_capture_time_ms
+                                    ? view.capture_time_ms
+                                    : 0u),
+           (unsigned long long)capture_gap_ms,
+           view.sequence,
+           previous_sequence,
+           previous_valid,
+           sequence_delta,
+           rtp_continuous,
+           continuous,
+           view.marker,
+           sequence_status,
+           (unsigned long long)receive_ms,
+           (unsigned long long)(view.has_send_time_ms ? view.send_time_ms : 0u),
+           (long long)(view.has_send_time_ms
+                           ? (int64_t)receive_ms - (int64_t)view.send_time_ms
+                           : -1),
+           view.payload_length,
+           recipients);
 
     ++g_clients[sender_index].forwarded_packets;
     if (g_clients[sender_index].forwarded_packets == 1 ||
@@ -724,6 +993,32 @@ static void handle_rtp_packet(int rtp_fd,
     }
 }
 
+static void log_rtp_stats(void)
+{
+    uint64_t now_ms = ptt_now_ms();
+
+    if (g_rtp_stats_started_ms == 0) {
+        g_rtp_stats_started_ms = now_ms;
+        return;
+    }
+    if (now_ms - g_rtp_stats_started_ms < 1000u) {
+        return;
+    }
+    if (g_rtp_stats_received_packets > 0 || g_rtp_stats_send_errors > 0) {
+        printf("[rtp/1s] received=%llu forwarded_copies=%llu send_errors=%llu "
+               "drain_max=%llu\n",
+               (unsigned long long)g_rtp_stats_received_packets,
+               (unsigned long long)g_rtp_stats_forwarded_copies,
+               (unsigned long long)g_rtp_stats_send_errors,
+               (unsigned long long)g_rtp_stats_max_drain_packets);
+    }
+    g_rtp_stats_started_ms = now_ms;
+    g_rtp_stats_received_packets = 0;
+    g_rtp_stats_forwarded_copies = 0;
+    g_rtp_stats_send_errors = 0;
+    g_rtp_stats_max_drain_packets = 0;
+}
+
 static void maintain_state(unsigned int floor_timeout_seconds)
 {
     uint64_t now = ptt_now_ms();
@@ -741,7 +1036,8 @@ static void maintain_state(unsigned int floor_timeout_seconds)
     for (i = 0; i < SERVER_MAX_FLOORS; ++i) {
         if (g_floors[i].used && g_floors[i].owner_index >= 0 &&
             floor_timeout_seconds > 0 &&
-            now - g_floors[i].granted_at_ms >= (uint64_t)floor_timeout_seconds * 1000u) {
+            now - g_floors[i].last_rtp_ms >=
+                (uint64_t)floor_timeout_seconds * 1000u) {
             int owner = g_floors[i].owner_index;
             send_group_event(g_floors[i].group,
                              g_clients[owner].id,
@@ -782,10 +1078,12 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGUSR1, on_signal);
     setvbuf(stdout, NULL, _IOLBF, 0);
     g_sip_fd = sip_fd;
     started_at = ptt_now_ms();
 
+    printf("PTT server version: %s\n", PTT_PRODUCT_VERSION);
     printf("PTT server started: SIP/UDP %s:%u, RTP/UDP %s:%u\n",
            config.bind_ip,
            config.sip_port,
@@ -799,6 +1097,11 @@ int main(int argc, char **argv)
         struct timeval timeout;
         int maximum_fd = sip_fd > rtp_fd ? sip_fd : rtp_fd;
         int selected;
+
+        if (g_dump_packet_history) {
+            g_dump_packet_history = 0;
+            dump_packet_history();
+        }
 
         if (config.run_seconds > 0 &&
             ptt_now_ms() - started_at >= (uint64_t)config.run_seconds * 1000u) {
@@ -836,21 +1139,39 @@ int main(int argc, char **argv)
         }
 
         if (FD_ISSET(rtp_fd, &read_set)) {
-            uint8_t packet[PTT_MAX_RTP_PACKET];
-            struct sockaddr_in source;
-            socklen_t source_length = sizeof(source);
-            ssize_t received = recvfrom(rtp_fd,
-                                        packet,
-                                        sizeof(packet),
-                                        0,
-                                        (struct sockaddr *)&source,
-                                        &source_length);
-            if (received > 0) {
+            uint64_t drained_packets = 0;
+
+            for (;;) {
+                uint8_t packet[PTT_MAX_RTP_PACKET];
+                struct sockaddr_in source;
+                socklen_t source_length = sizeof(source);
+                ssize_t received = recvfrom(rtp_fd,
+                                            packet,
+                                            sizeof(packet),
+                                            MSG_DONTWAIT,
+                                            (struct sockaddr *)&source,
+                                            &source_length);
+                if (received < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                        break;
+                    }
+                    fprintf(stderr, "RTP recvfrom failed: %s\n", strerror(errno));
+                    break;
+                }
+                if (received == 0) {
+                    break;
+                }
+                ++drained_packets;
+                ++g_rtp_stats_received_packets;
                 handle_rtp_packet(rtp_fd, &source, packet, (size_t)received);
+            }
+            if (drained_packets > g_rtp_stats_max_drain_packets) {
+                g_rtp_stats_max_drain_packets = drained_packets;
             }
         }
 
         maintain_state(config.floor_timeout_seconds);
+        log_rtp_stats();
     }
 
     close(sip_fd);
